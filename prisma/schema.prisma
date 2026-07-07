@@ -1,0 +1,494 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  USER
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum AppearanceMode {
+  SYSTEM
+  LIGHT
+  DARK
+}
+
+enum ResponseMode {
+  NORMAL
+  ADVANCED
+}
+
+enum ChatMessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+enum FileType {
+  AVATAR
+  CHAT_ATTACHMENT
+  IMAGE_ATTACHMENT
+  AUDIO_ATTACHMENT
+  VIDEO_ATTACHMENT
+  DOCUMENT_ATTACHMENT
+  KNOWLEDGE_IMPORT
+}
+
+enum UploadStatus {
+  PENDING
+  UPLOADED
+  FAILED
+  DELETED
+}
+
+enum ProcessingStatus {
+  NONE
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
+enum KnowledgeSourceType {
+  CALL_TEXT
+  CLIENT_CHAT
+  DOCUMENT_TEXT
+  FAQ
+  MANUAL
+}
+
+enum ConversationChannel {
+  PHONE
+  WHATSAPP
+  TELEGRAM
+  WEBSITE
+  CRM
+  EMAIL
+  MANUAL
+}
+
+enum KnowledgeConversationStatus {
+  DRAFT
+  READY
+  PROCESSING
+  INDEXED
+  FAILED
+  ARCHIVED
+}
+
+enum SenderRole {
+  CLIENT
+  MANAGER
+  ASSISTANT
+  SYSTEM
+  UNKNOWN
+}
+
+enum KnowledgeChunkType {
+  FULL_CONVERSATION
+  DIALOG_FRAGMENT
+  CLIENT_QUESTION
+  MANAGER_ANSWER
+  SUMMARY
+  OBJECTION
+  PRICE_DISCUSSION
+  DELIVERY_DISCUSSION
+  PRODUCT_CONSULTATION
+  PAYMENT_DISCUSSION
+}
+
+enum ImportStatus {
+  CREATED
+  UPLOADED
+  PROCESSING
+  COMPLETED
+  PARTIAL
+  FAILED
+  CANCELLED
+}
+
+enum ImportItemStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+  SKIPPED
+}
+
+model User {
+  id           String     @id @default(cuid())
+  clerkId      String     @unique
+  email        String     @unique
+  name         String?
+  username     String?    @unique
+  role         UserRole   @default(USER)
+  status       UserStatus @default(ACTIVE)
+  avatarFileId String?
+
+  settings UserSettings?
+  chats    Chat[]
+  messages Message[]
+  files    File[]
+
+  knowledgeSources KnowledgeSource[]
+  importBatches    ImportBatch[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([role])
+  @@index([status])
+}
+
+model UserSettings {
+  id String @id @default(cuid())
+
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  language       String         @default("ru")
+  appearance     AppearanceMode @default(SYSTEM)
+  assistantVoice String         @default("Cherry")
+  assistantModel String         @default("qwen3.7-plus")
+  assistantVoiceModel String    @default("extended")
+  responseMode   ResponseMode   @default(NORMAL)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Chat {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title         String  @default("Новый чат")
+  isPinned      Boolean @default(false)
+  isArchived    Boolean @default(false)
+  isDeleted     Boolean @default(false)
+  lastMessageAt DateTime?
+
+  messages Message[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([isPinned])
+  @@index([isDeleted])
+  @@index([lastMessageAt])
+}
+
+model Message {
+  id String @id @default(cuid())
+
+  chatId String
+  chat   Chat   @relation(fields: [chatId], references: [id], onDelete: Cascade)
+
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  role         ChatMessageRole
+  content      String          @db.Text
+  model        String?
+  responseMode ResponseMode?
+  metadata     Json?
+
+  attachments MessageAttachment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([chatId])
+  @@index([userId])
+  @@index([role])
+  @@index([createdAt])
+}
+
+model MessageAttachment {
+  id String @id @default(cuid())
+
+  messageId String
+  message   Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  fileId String
+  file   File   @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([messageId])
+  @@index([fileId])
+}
+
+model File {
+  id String @id @default(cuid())
+
+  ownerId String?
+  owner   User?   @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+
+  bucket       String
+  s3Key        String @unique
+  originalName String
+  mimeType     String
+  extension    String?
+  sizeBytes    BigInt
+
+  fileType         FileType
+  uploadStatus     UploadStatus     @default(PENDING)
+  processingStatus ProcessingStatus @default(NONE)
+
+  messageAttachments MessageAttachment[]
+  importItems        ImportItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerId])
+  @@index([fileType])
+  @@index([uploadStatus])
+  @@index([processingStatus])
+}
+
+model KnowledgeSource {
+  id String @id @default(cuid())
+
+  title       String
+  description String?
+  sourceType  KnowledgeSourceType
+
+  uploadedById String?
+  uploadedBy   User?   @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  status         ImportStatus @default(CREATED)
+  totalItems     Int          @default(0)
+  processedItems Int          @default(0)
+  failedItems    Int          @default(0)
+
+  conversations KnowledgeConversation[]
+  importBatches ImportBatch[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sourceType])
+  @@index([status])
+  @@index([uploadedById])
+}
+
+model KnowledgeConversation {
+  id String @id @default(cuid())
+
+  sourceId String?
+  source   KnowledgeSource? @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+
+  sourceType KnowledgeSourceType
+  channel    ConversationChannel @default(MANUAL)
+  externalId String?
+
+  managerName String?
+  clientName  String?
+  clientPhone String?
+  clientEmail String?
+
+  productName String?
+  city        String?
+  language    String @default("ru")
+
+  conversationDate DateTime?
+
+  rawText        String  @db.Text
+  normalizedText String? @db.Text
+
+  summary      String? @db.Text
+  clientIntent String?
+  result       String?
+
+  status KnowledgeConversationStatus @default(DRAFT)
+
+  messages KnowledgeMessage[]
+  chunks   KnowledgeChunk[]
+  insight  KnowledgeInsight?
+
+  importItems ImportItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sourceId])
+  @@index([sourceType])
+  @@index([channel])
+  @@index([managerName])
+  @@index([productName])
+  @@index([city])
+  @@index([conversationDate])
+  @@index([status])
+  @@unique([sourceId, externalId])
+}
+
+model KnowledgeMessage {
+  id String @id @default(cuid())
+
+  conversationId String
+  conversation   KnowledgeConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  orderIndex Int
+  senderRole SenderRole @default(UNKNOWN)
+  senderName String?
+  text       String     @db.Text
+  sentAt     DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([conversationId])
+  @@index([senderRole])
+  @@index([orderIndex])
+}
+
+model KnowledgeChunk {
+  id String @id @default(cuid())
+
+  conversationId String
+  conversation   KnowledgeConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  chunkType KnowledgeChunkType
+
+  text      String  @db.Text
+  cleanText String? @db.Text
+  summary   String? @db.Text
+
+  productName  String?
+  city         String?
+  managerName  String?
+  clientIntent String?
+  objection    String?
+
+  metadata Json?
+
+  qualityScore Float?
+  isApproved   Boolean @default(false)
+  isArchived   Boolean @default(false)
+
+  embedding Unsupported("vector(1536)")?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([conversationId])
+  @@index([chunkType])
+  @@index([productName])
+  @@index([city])
+  @@index([managerName])
+  @@index([isApproved])
+  @@index([isArchived])
+}
+
+model KnowledgeInsight {
+  id String @id @default(cuid())
+
+  conversationId String                @unique
+  conversation   KnowledgeConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  productNames     Json?
+  clientQuestions  Json?
+  managerAnswers   Json?
+  objections       Json?
+  priceMentions    Json?
+  deliveryMentions Json?
+  paymentMentions  Json?
+  nextSteps        Json?
+
+  sentiment String?
+  result    String?
+  summary   String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ImportBatch {
+  id String @id @default(cuid())
+
+  sourceId String?
+  source   KnowledgeSource? @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+
+  uploadedById String?
+  uploadedBy   User?   @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  title      String
+  importType String
+  status     ImportStatus @default(CREATED)
+
+  totalItems     Int @default(0)
+  processedItems Int @default(0)
+  failedItems    Int @default(0)
+
+  errorMessage String? @db.Text
+
+  items ImportItem[]
+
+  startedAt  DateTime?
+  finishedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@index([sourceId])
+  @@index([uploadedById])
+  @@index([status])
+}
+
+model ImportItem {
+  id String @id @default(cuid())
+
+  batchId String
+  batch   ImportBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  sourceFileId String?
+  sourceFile   File?   @relation(fields: [sourceFileId], references: [id], onDelete: SetNull)
+
+  conversationId String?
+  conversation   KnowledgeConversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+
+  externalId   String?
+  originalName String?
+  rowNumber    Int?
+
+  status       ImportItemStatus @default(PENDING)
+  errorMessage String?          @db.Text
+  retryCount   Int              @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([batchId])
+  @@index([sourceFileId])
+  @@index([conversationId])
+  @@index([status])
+}
+
+model AuditLog {
+  id String @id @default(cuid())
+
+  actorId    String?
+  action     String
+  entityType String?
+  entityId   String?
+  metadata   Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([actorId])
+  @@index([action])
+  @@index([entityType])
+  @@index([entityId])
+}
