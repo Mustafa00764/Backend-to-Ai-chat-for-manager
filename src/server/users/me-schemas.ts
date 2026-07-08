@@ -17,7 +17,9 @@ export const updateMeSchema = z.object({
         'username может содержать только латинские буквы, цифры, точку, дефис и нижнее подчеркивание'
     })
     .optional()
-    .or(z.literal(''))
+    .or(z.literal('')),
+
+  avatarFileId: z.string().nullable().optional()
 })
 
 export const appearanceModeSchema = z.enum(['SYSTEM', 'LIGHT', 'DARK'])

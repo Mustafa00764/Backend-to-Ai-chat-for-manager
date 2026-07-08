@@ -35,6 +35,9 @@ export async function updateMe(userId: string, input: UpdateMeInput) {
       ? undefined
       : normalizeOptionalString(input.username)
 
+  const avatarFileId =
+    input.avatarFileId === undefined ? undefined : input.avatarFileId
+
   try {
     return await prisma.user.update({
       where: {
@@ -42,7 +45,8 @@ export async function updateMe(userId: string, input: UpdateMeInput) {
       },
       data: {
         name,
-        username
+        username,
+        avatarFileId
       },
       include: {
         settings: true
