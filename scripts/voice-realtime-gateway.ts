@@ -24,6 +24,13 @@ const prisma = new PrismaClient({
   adapter
 })
 
+const server = createServer()
+
+const wss = new WebSocketServer({
+  server,
+  path: '/voice/realtime'
+})
+
 function sendJson(ws: WebSocket, payload: unknown) {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(payload))
@@ -73,15 +80,59 @@ function withEventId(event: Record<string, unknown>) {
   }
 }
 
-const server = createServer()
-
-const wss = new WebSocketServer({
-  server,
-  path: '/voice/realtime'
-})
-
 wss.on('connection', async (clientWs, request) => {
   let qwenWs: WebSocket | null = null
+  let qwenReady = false
+  let closing = false
+
+  const pendingClientEvents: Record<string, unknown>[] = []
+
+  function closeBoth() {
+    if (closing) return
+
+    closing = true
+
+    try {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.close()
+      }
+    } catch {}
+
+    try {
+      if (qwenWs && qwenWs.readyState === WebSocket.OPEN) {
+        qwenWs.close()
+      }
+    } catch {}
+  }
+
+  function sendToQwen(event: Record<string, unknown>) {
+    if (!qwenWs || !qwenReady || qwenWs.readyState !== WebSocket.OPEN) {
+      pendingClientEvents.push(event)
+
+      sendJson(clientWs, {
+        type: 'gateway.qwen_connecting',
+        queued: pendingClientEvents.length
+      })
+
+      return
+    }
+
+    sendJson(qwenWs, withEventId(event))
+  }
+
+  function flushPendingClientEvents() {
+    if (!qwenWs || !qwenReady || qwenWs.readyState !== WebSocket.OPEN) {
+      return
+    }
+
+    while (pendingClientEvents.length > 0) {
+      const event = pendingClientEvents.shift()
+
+      if (event) {
+        sendJson(qwenWs, withEventId(event))
+      }
+    }
+  }
 
   try {
     const token = getTokenFromRequestUrl(request.url)
@@ -129,10 +180,9 @@ wss.on('connection', async (clientWs, request) => {
     })
 
     qwenWs.on('open', () => {
-      sendJson(clientWs, {
-        type: 'gateway.connected',
-        userId: user.id
-      })
+      qwenReady = true
+
+      console.log(`Qwen realtime connected for user ${user.id}`)
 
       sendJson(
         qwenWs as WebSocket,
@@ -141,6 +191,13 @@ wss.on('connection', async (clientWs, request) => {
           session: defaultSession
         })
       )
+
+      sendJson(clientWs, {
+        type: 'gateway.connected',
+        userId: user.id
+      })
+
+      flushPendingClientEvents()
     })
 
     qwenWs.on('message', message => {
@@ -154,6 +211,8 @@ wss.on('connection', async (clientWs, request) => {
     })
 
     qwenWs.on('error', error => {
+      console.log('Qwen realtime socket error:', error.message)
+
       sendJson(clientWs, {
         type: 'gateway.qwen_error',
         error: error.message
@@ -161,13 +220,17 @@ wss.on('connection', async (clientWs, request) => {
     })
 
     qwenWs.on('close', (code, reason) => {
+      qwenReady = false
+
+      console.log(`Qwen realtime socket closed: ${code} ${reason.toString()}`)
+
       sendJson(clientWs, {
         type: 'gateway.qwen_closed',
         code,
         reason: reason.toString()
       })
 
-      clientWs.close()
+      closeBoth()
     })
 
     clientWs.on('message', message => {
@@ -182,33 +245,25 @@ wss.on('connection', async (clientWs, request) => {
         return
       }
 
-      if (!qwenWs || qwenWs.readyState !== WebSocket.OPEN) {
-        sendJson(clientWs, {
-          type: 'gateway.error',
-          error: 'Qwen realtime socket is not ready'
-        })
-
-        return
-      }
-
-      sendJson(qwenWs, withEventId(event as unknown as Record<string, unknown>))
+      sendToQwen(event as unknown as Record<string, unknown>)
     })
 
     clientWs.on('close', () => {
-      qwenWs?.close()
+      closeBoth()
     })
 
     clientWs.on('error', () => {
-      qwenWs?.close()
+      closeBoth()
     })
   } catch (error) {
+    console.log('Voice realtime gateway error:', error)
+
     sendJson(clientWs, {
       type: 'gateway.error',
       error: error instanceof Error ? error.message : 'Unknown gateway error'
     })
 
-    qwenWs?.close()
-    clientWs.close(1011, 'Gateway error')
+    closeBoth()
   }
 })
 

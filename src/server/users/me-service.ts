@@ -1,88 +1,84 @@
-import {
-  AppearanceMode,
-  Prisma,
-  ResponseMode,
-} from "@/generated/prisma/client";
-import { prisma } from "@/lib/db/prisma";
+import { AppearanceMode, Prisma, ResponseMode } from '@/generated/prisma/client'
+import { prisma } from '@/lib/db/prisma'
 import type {
   UpdateMeInput,
-  UpdateSettingsInput,
-} from "@/server/users/me-schemas";
+  UpdateSettingsInput
+} from '@/server/users/me-schemas'
 
 function normalizeOptionalString(value?: string) {
-  const trimmed = value?.trim();
+  const trimmed = value?.trim()
 
   if (!trimmed) {
-    return null;
+    return null
   }
 
-  return trimmed;
+  return trimmed
 }
 
 export async function getMe(userId: string) {
   return prisma.user.findUnique({
     where: {
-      id: userId,
+      id: userId
     },
     include: {
-      settings: true,
-    },
-  });
+      settings: true
+    }
+  })
 }
 
 export async function updateMe(userId: string, input: UpdateMeInput) {
   const name =
-    input.name === undefined ? undefined : normalizeOptionalString(input.name);
+    input.name === undefined ? undefined : normalizeOptionalString(input.name)
 
   const username =
     input.username === undefined
       ? undefined
-      : normalizeOptionalString(input.username);
+      : normalizeOptionalString(input.username)
 
   try {
     return await prisma.user.update({
       where: {
-        id: userId,
+        id: userId
       },
       data: {
         name,
-        username,
+        username
       },
       include: {
-        settings: true,
-      },
-    });
+        settings: true
+      }
+    })
   } catch (error) {
     if (
       error instanceof Prisma.PrismaClientKnownRequestError &&
-      error.code === "P2002"
+      error.code === 'P2002'
     ) {
-      throw new Error("Пользователь с таким username уже существует");
+      throw new Error('Пользователь с таким username уже существует')
     }
 
-    throw error;
+    throw error
   }
 }
 
 export async function getUserSettings(userId: string) {
   return prisma.userSettings.upsert({
     where: {
-      userId,
+      userId
     },
     create: {
-      userId,
+      userId
     },
-    update: {},
-  });
+    update: {}
+  })
 }
 
 export async function updateUserSettings(
   userId: string,
-  input: UpdateSettingsInput,
+  input: UpdateSettingsInput
 ) {
   return prisma.userSettings.upsert({
     where: {
-      userId,
+      userId
     },
     create: {
       userId,
@@ -91,7 +87,7 @@ export async function updateUserSettings(
       assistantVoice: input.assistantVoice,
       assistantModel: input.assistantModel,
       assistantVoiceModel: input.assistantVoiceModel,
-      responseMode: input.responseMode as ResponseMode | undefined,
+      responseMode: input.responseMode as ResponseMode | undefined
     },
     update: {
       language: input.language,
@@ -99,7 +95,7 @@ export async function updateUserSettings(
       assistantVoice: input.assistantVoice,
       assistantModel: input.assistantModel,
       assistantVoiceModel: input.assistantVoiceModel,
-      responseMode: input.responseMode as ResponseMode | undefined,
-    },
-  });
+      responseMode: input.responseMode as ResponseMode | undefined
+    }
+  })
 }
