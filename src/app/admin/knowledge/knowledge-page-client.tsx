@@ -95,6 +95,24 @@ type KnowledgeSearchResponse = {
   }>
 }
 
+type UploadItemStatus = 'queued' | 'uploading' | 'success' | 'error'
+
+type UploadItem = {
+  id: string
+  file: File
+  status: UploadItemStatus
+  progress: number
+  error?: string
+  stats?: ImportResponse['stats']
+}
+
+type ImportKnowledgeFileOptions = {
+  file: File
+  title: string
+  channel: string
+  onProgress: (progress: number) => void
+}
+
 async function fetchSources() {
   const response = await fetch('/api/admin-api/knowledge/sources')
 
@@ -105,19 +123,70 @@ async function fetchSources() {
   return response.json() as Promise<SourcesResponse>
 }
 
-async function importKnowledge(formData: FormData) {
-  const response = await fetch('/api/admin-api/knowledge/import', {
-    method: 'POST',
-    body: formData
+async function importKnowledgeFile({
+  file,
+  title,
+  channel,
+  onProgress
+}: ImportKnowledgeFileOptions) {
+  return new Promise<ImportResponse>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    const formData = new FormData()
+
+    formData.append('file', file)
+    formData.append('title', title || file.name)
+    formData.append('channel', channel)
+
+    xhr.open('POST', '/api/admin-api/knowledge/import')
+
+    xhr.upload.onprogress = event => {
+      if (!event.lengthComputable) return
+
+      const progress = Math.round((event.loaded / event.total) * 100)
+
+      /**
+       * 95%, потому что после загрузки файла backend ещё импортирует текст,
+       * режет на chunks и сохраняет в базу.
+       */
+      onProgress(Math.min(progress, 95))
+    }
+
+    xhr.onload = () => {
+      let json: unknown = null
+
+      try {
+        json = JSON.parse(xhr.responseText)
+      } catch {
+        json = null
+      }
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        onProgress(100)
+        resolve(json as ImportResponse)
+        return
+      }
+
+      const errorMessage =
+        json &&
+        typeof json === 'object' &&
+        'error' in json &&
+        typeof json.error === 'string'
+          ? json.error
+          : xhr.responseText || 'Не удалось импортировать файл'
+
+      reject(new Error(errorMessage))
+    }
+
+    xhr.onerror = () => {
+      reject(new Error('Ошибка сети при импорте файла'))
+    }
+
+    xhr.onabort = () => {
+      reject(new Error('Импорт файла был отменён'))
+    }
+
+    xhr.send(formData)
   })
-
-  const json = await response.json()
-
-  if (!response.ok) {
-    throw new Error(json.error || 'Не удалось импортировать файл')
-  }
-
-  return json as ImportResponse
 }
 
 async function fetchEmbeddingStats() {
@@ -161,6 +230,26 @@ async function searchKnowledge(query: string) {
   return json as KnowledgeSearchResponse
 }
 
+function createUploadItemId(file: File) {
+  return `${file.name}-${file.size}-${file.lastModified}-${Math.random()
+    .toString(36)
+    .slice(2)}`
+}
+
+function getUploadStatusLabel(status: UploadItemStatus) {
+  if (status === 'queued') return 'В очереди'
+  if (status === 'uploading') return 'Загрузка'
+  if (status === 'success') return 'Готово'
+  return 'Ошибка'
+}
+
+function getUploadStatusVariant(status: UploadItemStatus) {
+  if (status === 'success') return 'default'
+  if (status === 'error') return 'destructive'
+
+  return 'secondary'
+}
+
 function formatFileSize(bytes?: number | null) {
   if (!bytes) {
     return '—'
@@ -185,6 +274,8 @@ export function KnowledgePageClient() {
 
   const [title, setTitle] = useState('')
   const [channel, setChannel] = useState('OTHER')
+  const [uploadItems, setUploadItems] = useState<UploadItem[]>([])
+  const [isImporting, setIsImporting] = useState(false)
 
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResult, setSearchResult] =
@@ -198,32 +289,6 @@ export function KnowledgePageClient() {
   const embeddingStatsQuery = useQuery({
     queryKey: ['knowledge-embedding-stats'],
     queryFn: fetchEmbeddingStats
-  })
-
-  const importMutation = useMutation({
-    mutationFn: importKnowledge,
-    onSuccess: data => {
-      queryClient.invalidateQueries({
-        queryKey: ['knowledge-sources']
-      })
-
-      queryClient.invalidateQueries({
-        queryKey: ['knowledge-embedding-stats']
-      })
-
-      setTitle('')
-
-      if (fileInputRef.current) {
-        fileInputRef.current.value = ''
-      }
-
-      toast.success('База знаний импортирована', {
-        description: `Разговоров: ${data.stats.conversationsCount}, chunks: ${data.stats.chunksCount}`
-      })
-    },
-    onError: error => {
-      toast.error(error.message)
-    }
   })
 
   const embeddingsMutation = useMutation({
@@ -260,24 +325,168 @@ export function KnowledgePageClient() {
     setChannel(value ?? 'OTHER')
   }
 
-  function handleSubmit() {
-    const file = fileInputRef.current?.files?.[0]
+  function handleFilesChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? [])
 
-    if (!file) {
-      toast.error('Выбери TXT или JSONL файл')
+    if (files.length === 0) {
+      setUploadItems([])
       return
     }
 
-    const formData = new FormData()
+    const nextItems: UploadItem[] = files.map(file => ({
+      id: createUploadItemId(file),
+      file,
+      status: 'queued',
+      progress: 0
+    }))
 
-    formData.append('file', file)
-    formData.append('title', title || file.name)
-    formData.append('channel', channel)
+    setUploadItems(nextItems)
+  }
 
-    importMutation.mutate(formData)
+  function handleClearFiles() {
+    if (isImporting) return
+
+    setUploadItems([])
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
+  }
+
+  function updateUploadItem(
+    id: string,
+    updater: (item: UploadItem) => UploadItem
+  ) {
+    setUploadItems(prev =>
+      prev.map(item => {
+        if (item.id !== id) return item
+
+        return updater(item)
+      })
+    )
+  }
+
+  function createImportTitle(file: File) {
+    const cleanTitle = title.trim()
+
+    if (!cleanTitle) {
+      return file.name
+    }
+
+    if (uploadItems.length === 1) {
+      return cleanTitle
+    }
+
+    return `${cleanTitle}: ${file.name}`
+  }
+
+  async function handleSubmit() {
+    if (uploadItems.length === 0) {
+      toast.error('Выбери TXT или JSONL файлы')
+      return
+    }
+
+    const itemsToImport = uploadItems.filter(item => item.status !== 'success')
+
+    if (itemsToImport.length === 0) {
+      toast.success('Все выбранные файлы уже импортированы')
+      return
+    }
+
+    setIsImporting(true)
+
+    let successCount = 0
+    let errorCount = 0
+
+    for (const item of itemsToImport) {
+      updateUploadItem(item.id, current => ({
+        ...current,
+        status: 'uploading',
+        progress: 0,
+        error: undefined
+      }))
+
+      try {
+        const data = await importKnowledgeFile({
+          file: item.file,
+          title: createImportTitle(item.file),
+          channel,
+          onProgress: progress => {
+            updateUploadItem(item.id, current => ({
+              ...current,
+              progress
+            }))
+          }
+        })
+
+        successCount += 1
+
+        updateUploadItem(item.id, current => ({
+          ...current,
+          status: 'success',
+          progress: 100,
+          stats: data.stats,
+          error: undefined
+        }))
+
+        toast.success(`Импортирован: ${item.file.name}`, {
+          description: `Разговоров: ${data.stats.conversationsCount}, chunks: ${data.stats.chunksCount}`
+        })
+      } catch (error) {
+        errorCount += 1
+
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Не удалось импортировать файл'
+
+        updateUploadItem(item.id, current => ({
+          ...current,
+          status: 'error',
+          progress: 0,
+          error: message
+        }))
+
+        toast.error(`Ошибка импорта: ${item.file.name}`, {
+          description: message
+        })
+      }
+    }
+
+    setIsImporting(false)
+
+    if (successCount > 0) {
+      queryClient.invalidateQueries({
+        queryKey: ['knowledge-sources']
+      })
+
+      queryClient.invalidateQueries({
+        queryKey: ['knowledge-embedding-stats']
+      })
+    }
+
+    if (successCount > 0 && errorCount === 0) {
+      toast.success('Импорт завершён', {
+        description: `Успешно импортировано файлов: ${successCount}`
+      })
+    }
+
+    if (errorCount > 0) {
+      toast.error('Импорт завершён с ошибками', {
+        description: `Успешно: ${successCount}, ошибок: ${errorCount}`
+      })
+    }
   }
 
   const sources = sourcesQuery.data?.sources ?? []
+
+  const importedCount = uploadItems.filter(
+    item => item.status === 'success'
+  ).length
+
+  const errorCount = uploadItems.filter(item => item.status === 'error').length
+
+  const uploadingItem = uploadItems.find(item => item.status === 'uploading')
 
   return (
     <div className="space-y-6">
@@ -305,12 +514,21 @@ export function KnowledgePageClient() {
                 value={title}
                 onChange={event => setTitle(event.target.value)}
                 placeholder="Например: Старые звонки менеджеров за 2024"
+                disabled={isImporting}
               />
+              <p className="text-xs text-muted-foreground">
+                Если выбрано несколько файлов, название будет добавлено к
+                каждому файлу как префикс.
+              </p>
             </div>
 
             <div className="space-y-2">
               <Label>Канал</Label>
-              <Select value={channel} onValueChange={handleChannelChange}>
+              <Select
+                value={channel}
+                onValueChange={handleChannelChange}
+                disabled={isImporting}
+              >
                 <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
@@ -327,21 +545,111 @@ export function KnowledgePageClient() {
           </div>
 
           <div className="space-y-2">
-            <Label>Файл</Label>
+            <Label>Файлы</Label>
             <Input
               ref={fileInputRef}
               type="file"
+              multiple
               accept=".txt,.jsonl,text/plain,application/json"
+              onChange={handleFilesChange}
+              disabled={isImporting}
             />
             <p className="text-xs text-muted-foreground">
-              TXT: один разговор или несколько частей через строку с ---. JSONL:
-              один JSON-объект разговора на строку.
+              Можно выбрать сразу много TXT или JSONL файлов. Импорт будет идти
+              постепенно: файл за файлом.
             </p>
           </div>
 
-          <Button onClick={handleSubmit} disabled={importMutation.isPending}>
+          {uploadItems.length > 0 ? (
+            <div className="space-y-3 rounded-lg border p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-medium">
+                    Выбрано файлов: {uploadItems.length}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Готово: {importedCount}, ошибок: {errorCount}
+                  </p>
+                </div>
+
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleClearFiles}
+                  disabled={isImporting}
+                >
+                  Очистить список
+                </Button>
+              </div>
+
+              {uploadingItem ? (
+                <p className="text-xs text-muted-foreground">
+                  Сейчас импортируется: {uploadingItem.file.name}
+                </p>
+              ) : null}
+
+              <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
+                {uploadItems.map(item => (
+                  <div key={item.id} className="rounded-md border p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-medium">
+                          {item.file.name}
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          {formatFileSize(item.file.size)}
+                        </p>
+                      </div>
+
+                      <Badge variant={getUploadStatusVariant(item.status)}>
+                        {getUploadStatusLabel(item.status)}
+                      </Badge>
+                    </div>
+
+                    <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted">
+                      <div
+                        className="h-full bg-primary transition-all"
+                        style={{
+                          width: `${item.progress}%`
+                        }}
+                      />
+                    </div>
+
+                    {item.status === 'uploading' ? (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {item.progress < 95
+                          ? `Загрузка: ${item.progress}%`
+                          : 'Файл загружен, backend импортирует данные...'}
+                      </p>
+                    ) : null}
+
+                    {item.stats ? (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Разговоров: {item.stats.conversationsCount}, сообщений:{' '}
+                        {item.stats.messagesCount}, chunks:{' '}
+                        {item.stats.chunksCount}
+                      </p>
+                    ) : null}
+
+                    {item.error ? (
+                      <p className="mt-1 text-xs text-destructive">
+                        {item.error}
+                      </p>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          <Button
+            onClick={handleSubmit}
+            disabled={isImporting || uploadItems.length === 0}
+          >
             <Database className="mr-2 h-4 w-4" />
-            {importMutation.isPending ? 'Импорт...' : 'Импортировать'}
+            {isImporting
+              ? 'Импортирую постепенно...'
+              : `Импортировать файлов: ${uploadItems.length}`}
           </Button>
         </CardContent>
       </Card>
