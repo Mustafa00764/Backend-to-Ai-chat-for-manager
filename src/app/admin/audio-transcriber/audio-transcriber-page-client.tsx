@@ -1010,7 +1010,7 @@ export function AudioTranscriberPageClient() {
               )}
               {isProcessing
                 ? `Обработка... активных: ${processingCount}`
-                : `Конвертировать пачками по 50: ${items.length}`}
+                : `Конвертировать пачками по ${TRANSCRIBE_BATCH_SIZE}: ${items.length}`}
             </Button>
 
             <Button
