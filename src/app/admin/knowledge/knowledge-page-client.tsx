@@ -1,8 +1,8 @@
 'use client'
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Database, RefreshCw, Upload } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { Database, FileAudio2, RefreshCw, Upload } from 'lucide-react'
+import { useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -97,6 +97,8 @@ type KnowledgeSearchResponse = {
 
 type UploadItemStatus = 'queued' | 'uploading' | 'success' | 'error'
 
+type UploadSourceKind = 'text' | 'audio'
+
 type UploadItem = {
   id: string
   file: File
@@ -110,8 +112,27 @@ type ImportKnowledgeFileOptions = {
   file: File
   title: string
   channel: string
+  sourceKind: UploadSourceKind
   onProgress: (progress: number) => void
 }
+
+const TEXT_ACCEPT =
+  '.txt,.jsonl,.xlsx,.xls,.csv,text/plain,application/json,application/jsonl,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv'
+
+const AUDIO_ACCEPT =
+  '.mp3,.wav,.m4a,.ogg,.aac,.flac,.webm,.mp4,audio/*,video/mp4'
+
+const TEXT_EXTENSIONS = new Set(['.txt', '.jsonl', '.xlsx', '.xls', '.csv'])
+const AUDIO_EXTENSIONS = new Set([
+  '.mp3',
+  '.wav',
+  '.m4a',
+  '.ogg',
+  '.aac',
+  '.flac',
+  '.webm',
+  '.mp4'
+])
 
 async function fetchSources() {
   const response = await fetch('/api/admin-api/knowledge/sources')
@@ -123,10 +144,45 @@ async function fetchSources() {
   return response.json() as Promise<SourcesResponse>
 }
 
+function getFileExtension(file: File) {
+  const name = file.name.toLowerCase()
+  const dotIndex = name.lastIndexOf('.')
+
+  if (dotIndex === -1) return ''
+
+  return name.slice(dotIndex)
+}
+
+function isAllowedFile(file: File, sourceKind: UploadSourceKind) {
+  const extension = getFileExtension(file)
+
+  if (sourceKind === 'audio') {
+    if (file.type.startsWith('audio/')) return true
+    if (file.type === 'video/mp4') return true
+
+    return AUDIO_EXTENSIONS.has(extension)
+  }
+
+  if (file.type === 'text/plain') return true
+  if (file.type === 'application/json') return true
+  if (file.type === 'application/jsonl') return true
+
+  return TEXT_EXTENSIONS.has(extension)
+}
+
+function getImportEndpoint(sourceKind: UploadSourceKind) {
+  if (sourceKind === 'audio') {
+    return '/api/admin-api/knowledge/audio/import'
+  }
+
+  return '/api/admin-api/knowledge/import'
+}
+
 async function importKnowledgeFile({
   file,
   title,
   channel,
+  sourceKind,
   onProgress
 }: ImportKnowledgeFileOptions) {
   return new Promise<ImportResponse>((resolve, reject) => {
@@ -136,8 +192,9 @@ async function importKnowledgeFile({
     formData.append('file', file)
     formData.append('title', title || file.name)
     formData.append('channel', channel)
+    formData.append('sourceKind', sourceKind)
 
-    xhr.open('POST', '/api/admin-api/knowledge/import')
+    xhr.open('POST', getImportEndpoint(sourceKind))
 
     xhr.upload.onprogress = event => {
       if (!event.lengthComputable) return
@@ -145,8 +202,8 @@ async function importKnowledgeFile({
       const progress = Math.round((event.loaded / event.total) * 100)
 
       /**
-       * 95%, потому что после загрузки файла backend ещё импортирует текст,
-       * режет на chunks и сохраняет в базу.
+       * 95%, потому что после загрузки файла backend ещё импортирует текст
+       * или расшифровывает аудио, режет на chunks и сохраняет в базу.
        */
       onProgress(Math.min(progress, 95))
     }
@@ -240,6 +297,7 @@ function getUploadStatusLabel(status: UploadItemStatus) {
   if (status === 'queued') return 'В очереди'
   if (status === 'uploading') return 'Загрузка'
   if (status === 'success') return 'Готово'
+
   return 'Ошибка'
 }
 
@@ -265,7 +323,53 @@ function formatFileSize(bytes?: number | null) {
     return `${kb.toFixed(1)} KB`
   }
 
-  return `${(kb / 1024).toFixed(1)} MB`
+  const mb = kb / 1024
+
+  if (mb < 1024) {
+    return `${mb.toFixed(1)} MB`
+  }
+
+  return `${(mb / 1024).toFixed(2)} GB`
+}
+
+function getSourceKindLabel(sourceKind: UploadSourceKind) {
+  if (sourceKind === 'audio') {
+    return 'Аудиофайлы'
+  }
+
+  return 'Текстовые файлы'
+}
+
+function getFileInputAccept(sourceKind: UploadSourceKind) {
+  if (sourceKind === 'audio') {
+    return AUDIO_ACCEPT
+  }
+
+  return TEXT_ACCEPT
+}
+
+function getFileInputHint(sourceKind: UploadSourceKind) {
+  if (sourceKind === 'audio') {
+    return 'Можно выбрать сразу много MP3, WAV, M4A, OGG, AAC, FLAC, WEBM или MP4. Файлы будут загружаться на сервер, сервер расшифрует аудио в текст и добавит результат в базу знаний.'
+  }
+
+  return 'Можно выбрать сразу много TXT, JSONL, XLSX, XLS или CSV файлов. Excel-таблицы будут превращены в текст и импортированы в базу знаний.'
+}
+
+function getImportButtonLabel(
+  sourceKind: UploadSourceKind,
+  isImporting: boolean,
+  count: number
+) {
+  if (isImporting) {
+    return sourceKind === 'audio'
+      ? 'Загружаю и расшифровываю аудио...'
+      : 'Импортирую постепенно...'
+  }
+
+  return sourceKind === 'audio'
+    ? `Загрузить и обработать аудио: ${count}`
+    : `Импортировать файлов: ${count}`
 }
 
 export function KnowledgePageClient() {
@@ -273,7 +377,8 @@ export function KnowledgePageClient() {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   const [title, setTitle] = useState('')
-  const [channel, setChannel] = useState('OTHER')
+  const [channel, setChannel] = useState('PHONE')
+  const [sourceKind, setSourceKind] = useState<UploadSourceKind>('text')
   const [uploadItems, setUploadItems] = useState<UploadItem[]>([])
   const [isImporting, setIsImporting] = useState(false)
 
@@ -321,6 +426,29 @@ export function KnowledgePageClient() {
     }
   })
 
+  const acceptedExtensionsLabel = useMemo(() => {
+    return sourceKind === 'audio'
+      ? 'MP3, WAV, M4A, OGG, AAC, FLAC, WEBM, MP4'
+      : 'TXT, JSONL'
+  }, [sourceKind])
+
+  function handleSourceKindChange(value: string | null) {
+    const nextKind: UploadSourceKind = value === 'audio' ? 'audio' : 'text'
+
+    if (isImporting) return
+
+    setSourceKind(nextKind)
+    setUploadItems([])
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
+
+    if (nextKind === 'audio') {
+      setChannel('PHONE')
+    }
+  }
+
   function handleChannelChange(value: string | null) {
     setChannel(value ?? 'OTHER')
   }
@@ -333,7 +461,26 @@ export function KnowledgePageClient() {
       return
     }
 
-    const nextItems: UploadItem[] = files.map(file => ({
+    const allowedFiles = files.filter(file => isAllowedFile(file, sourceKind))
+    const rejectedCount = files.length - allowedFiles.length
+
+    if (rejectedCount > 0) {
+      toast.error('Некоторые файлы не подходят', {
+        description: `Отклонено файлов: ${rejectedCount}. Разрешено: ${acceptedExtensionsLabel}`
+      })
+    }
+
+    if (allowedFiles.length === 0) {
+      setUploadItems([])
+
+      if (fileInputRef.current) {
+        fileInputRef.current.value = ''
+      }
+
+      return
+    }
+
+    const nextItems: UploadItem[] = allowedFiles.map(file => ({
       id: createUploadItemId(file),
       file,
       status: 'queued',
@@ -382,7 +529,11 @@ export function KnowledgePageClient() {
 
   async function handleSubmit() {
     if (uploadItems.length === 0) {
-      toast.error('Выбери TXT или JSONL файлы')
+      toast.error(
+        sourceKind === 'audio'
+          ? 'Выбери аудиофайлы'
+          : 'Выбери TXT, JSONL, Excel или CSV файлы'
+      )
       return
     }
 
@@ -398,7 +549,26 @@ export function KnowledgePageClient() {
     let successCount = 0
     let errorCount = 0
 
-    for (const item of itemsToImport) {
+    /**
+     * Сколько файлов можно загружать одновременно.
+     *
+     * Для аудио лучше не ставить большое число, чтобы не перегрузить сервер.
+     * 2 — безопасный старт.
+     *
+     * Для текстов/Excel можно чуть больше.
+     */
+    const uploadConcurrency = sourceKind === 'audio' ? 2 : 4
+
+    let nextIndex = 0
+
+    async function uploadNextFile() {
+      const item = itemsToImport[nextIndex]
+      nextIndex += 1
+
+      if (!item) {
+        return
+      }
+
       updateUploadItem(item.id, current => ({
         ...current,
         status: 'uploading',
@@ -411,6 +581,7 @@ export function KnowledgePageClient() {
           file: item.file,
           title: createImportTitle(item.file),
           channel,
+          sourceKind,
           onProgress: progress => {
             updateUploadItem(item.id, current => ({
               ...current,
@@ -430,7 +601,9 @@ export function KnowledgePageClient() {
         }))
 
         toast.success(`Импортирован: ${item.file.name}`, {
-          description: `Разговоров: ${data.stats.conversationsCount}, chunks: ${data.stats.chunksCount}`
+          description: data.stats
+            ? `Разговоров: ${data.stats.conversationsCount}, chunks: ${data.stats.chunksCount}`
+            : 'Файл успешно загружен на сервер'
         })
       } catch (error) {
         errorCount += 1
@@ -451,7 +624,18 @@ export function KnowledgePageClient() {
           description: message
         })
       }
+
+      await uploadNextFile()
     }
+
+    const workers = Array.from(
+      {
+        length: Math.min(uploadConcurrency, itemsToImport.length)
+      },
+      () => uploadNextFile()
+    )
+
+    await Promise.all(workers)
 
     setIsImporting(false)
 
@@ -493,27 +677,55 @@ export function KnowledgePageClient() {
       <div>
         <h1 className="text-3xl font-bold tracking-tight">База знаний</h1>
         <p className="text-muted-foreground">
-          Импорт старых разговоров менеджеров, документов и текстовых
-          источников.
+          Импорт старых разговоров менеджеров, документов, текстовых источников
+          и аудиозвонков для базы знаний ассистента.
         </p>
       </div>
 
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Upload className="h-5 w-5" />
+            {sourceKind === 'audio' ? (
+              <FileAudio2 className="h-5 w-5" />
+            ) : (
+              <Upload className="h-5 w-5" />
+            )}
             Импорт разговоров
           </CardTitle>
         </CardHeader>
 
         <CardContent className="space-y-4">
-          <div className="grid gap-4 md:grid-cols-[1fr_220px]">
+          <div className="grid gap-4 md:grid-cols-[240px_1fr_220px]">
+            <div className="space-y-2">
+              <Label>Тип импорта</Label>
+              <Select
+                value={sourceKind}
+                onValueChange={handleSourceKindChange}
+                disabled={isImporting}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="text">Текстовые файлы</SelectItem>
+                  <SelectItem value="audio">Аудиофайлы</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {getSourceKindLabel(sourceKind)}
+              </p>
+            </div>
+
             <div className="space-y-2">
               <Label>Название источника</Label>
               <Input
                 value={title}
                 onChange={event => setTitle(event.target.value)}
-                placeholder="Например: Старые звонки менеджеров за 2024"
+                placeholder={
+                  sourceKind === 'audio'
+                    ? 'Например: Звонки менеджеров за 2024'
+                    : 'Например: Старые звонки менеджеров за 2024'
+                }
                 disabled={isImporting}
               />
               <p className="text-xs text-muted-foreground">
@@ -544,19 +756,34 @@ export function KnowledgePageClient() {
             </div>
           </div>
 
+          {sourceKind === 'audio' ? (
+            <div className="rounded-lg border bg-muted/40 p-4">
+              <p className="text-sm font-medium">Как будет обработано аудио</p>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Файл загрузится на сервер, сервер расшифрует аудио в текст,
+                затем текст будет импортирован как разговор в базу знаний,
+                разбит на chunks и подготовлен для embeddings. Qwen будет
+                использовать эти данные как память через поиск по базе знаний.
+              </p>
+            </div>
+          ) : null}
+
           <div className="space-y-2">
             <Label>Файлы</Label>
             <Input
+              key={sourceKind}
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".txt,.jsonl,text/plain,application/json"
+              accept={getFileInputAccept(sourceKind)}
               onChange={handleFilesChange}
               disabled={isImporting}
             />
             <p className="text-xs text-muted-foreground">
-              Можно выбрать сразу много TXT или JSONL файлов. Импорт будет идти
-              постепенно: файл за файлом.
+              {getFileInputHint(sourceKind)}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Разрешено: {acceptedExtensionsLabel}
             </p>
           </div>
 
@@ -619,7 +846,9 @@ export function KnowledgePageClient() {
                       <p className="mt-1 text-xs text-muted-foreground">
                         {item.progress < 95
                           ? `Загрузка: ${item.progress}%`
-                          : 'Файл загружен, backend импортирует данные...'}
+                          : sourceKind === 'audio'
+                            ? 'Файл загружен, backend расшифровывает аудио и импортирует текст...'
+                            : 'Файл загружен, backend импортирует данные...'}
                       </p>
                     ) : null}
 
@@ -647,9 +876,7 @@ export function KnowledgePageClient() {
             disabled={isImporting || uploadItems.length === 0}
           >
             <Database className="mr-2 h-4 w-4" />
-            {isImporting
-              ? 'Импортирую постепенно...'
-              : `Импортировать файлов: ${uploadItems.length}`}
+            {getImportButtonLabel(sourceKind, isImporting, uploadItems.length)}
           </Button>
         </CardContent>
       </Card>
