@@ -84,12 +84,13 @@ const STORAGE_KEY = 'fun-asr-audio-transcriber-settings'
 
 const DEFAULT_SETTINGS: SavedSettings = {
   apiKey: '',
-  apiUrl: 'https://ws-3m6rwjs94flv68ph.ap-southeast-1.maas.aliyuncs.com/api/v1',
-  model: 'fun-asr',
+  apiUrl:
+    'https://ws-3m6rwjs94flv68ph.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
+  model: 'fun-asr-flash-2026-06-15',
   sampleRate: '',
   context:
     'Это телефонный разговор менеджера с клиентом. Тематика: профнастил, сэндвич-панели, металлочерепица, цена, доставка, сроки, заказ.',
-  diarizationEnabled: true,
+  diarizationEnabled: false,
   speakerCount: '2',
   speaker0Role: 'Менеджер',
   speaker1Role: 'Клиент'
@@ -241,7 +242,56 @@ function createTxtContent(item: TranscribeItem) {
   return item.text.trim()
 }
 
-function downloadBlob(fileName: string, blob: Blob) {
+function getDownloadFileName(response: Response, fallbackFileName: string) {
+  const contentDisposition = response.headers.get('Content-Disposition')
+
+  if (!contentDisposition) {
+    return fallbackFileName
+  }
+
+  const utf8Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i)
+
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1])
+    } catch {
+      return fallbackFileName
+    }
+  }
+
+  const normalMatch = contentDisposition.match(/filename="?([^"]+)"?/i)
+
+  if (normalMatch?.[1]) {
+    return normalMatch[1]
+  }
+
+  return fallbackFileName
+}
+
+async function downloadBlobFromResponse(
+  response: Response,
+  fallbackFileName: string
+) {
+  const blob = await response.blob()
+
+  if (!response.ok) {
+    let message = 'Не удалось скачать файл'
+
+    try {
+      const errorText = await blob.text()
+      const errorJson = JSON.parse(errorText) as { error?: string }
+
+      if (errorJson.error) {
+        message = errorJson.error
+      }
+    } catch {
+      // ignore
+    }
+
+    throw new Error(message)
+  }
+
+  const fileName = getDownloadFileName(response, fallbackFileName)
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
 
@@ -259,12 +309,17 @@ function downloadBlob(fileName: string, blob: Blob) {
   }, 1500)
 }
 
-function downloadTextFile(fileName: string, text: string) {
-  const blob = new Blob([text], {
-    type: 'text/plain;charset=utf-8'
-  })
+function createRoleContext(settings: SavedSettings) {
+  if (!settings.diarizationEnabled) {
+    return settings.context.trim()
+  }
 
-  downloadBlob(fileName, blob)
+  return [
+    settings.context.trim(),
+    `Если возможно, оформи расшифровку по ролям: ${settings.speaker0Role.trim() || 'Менеджер'} и ${settings.speaker1Role.trim() || 'Клиент'}.`
+  ]
+    .filter(Boolean)
+    .join('\n')
 }
 
 async function transcribeFile(params: { file: File; settings: SavedSettings }) {
@@ -275,7 +330,7 @@ async function transcribeFile(params: { file: File; settings: SavedSettings }) {
   formData.append('apiUrl', params.settings.apiUrl.trim())
   formData.append('model', params.settings.model.trim())
   formData.append('sampleRate', params.settings.sampleRate.trim())
-  formData.append('context', params.settings.context.trim())
+  formData.append('context', createRoleContext(params.settings))
   formData.append(
     'diarizationEnabled',
     String(params.settings.diarizationEnabled)
@@ -423,7 +478,7 @@ export function AudioTranscriberPageClient() {
     }
   }
 
-  function handleDownloadItem(item: TranscribeItem) {
+  async function handleDownloadItem(item: TranscribeItem) {
     const text = createTxtContent(item)
 
     if (!text) {
@@ -431,32 +486,32 @@ export function AudioTranscriberPageClient() {
       return
     }
 
-    downloadTextFile(createBaseTxtFileName(item.file.name), text)
-  }
+    const fileName = createBaseTxtFileName(item.file.name)
 
-  function handleDownloadAllSeparateTxt() {
-    const readyItems = getReadyItems()
+    try {
+      const response = await fetch(
+        '/api/admin-api/audio-transcriber/download-txt',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            fileName,
+            text
+          })
+        }
+      )
 
-    if (readyItems.length === 0) {
-      toast.error('Нет готовых текстов')
-      return
+      await downloadBlobFromResponse(response, fileName)
+
+      toast.success('TXT скачан')
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Не удалось скачать TXT'
+
+      toast.error(message)
     }
-
-    const usedNames = new Set<string>()
-
-    readyItems.forEach((item, index) => {
-      const fileName = createUniqueTxtFileName(item, index, usedNames)
-      const content = createTxtContent(item)
-
-      window.setTimeout(() => {
-        downloadTextFile(fileName, content)
-      }, index * 900)
-    })
-
-    toast.success('Скачивание отдельных TXT запущено', {
-      description:
-        'Если браузер заблокирует часть файлов, используй “Скачать ZIP” или “Сохранить все в папку”.'
-    })
   }
 
   async function handleDownloadZip() {
@@ -483,26 +538,7 @@ export function AudioTranscriberPageClient() {
         }
       )
 
-      const blob = await response.blob()
-
-      if (!response.ok) {
-        let message = 'Не удалось создать ZIP'
-
-        try {
-          const text = await blob.text()
-          const json = JSON.parse(text) as { error?: string }
-
-          if (json.error) {
-            message = json.error
-          }
-        } catch {
-          // ignore
-        }
-
-        throw new Error(message)
-      }
-
-      downloadBlob('audio_transcripts_txt.zip', blob)
+      await downloadBlobFromResponse(response, 'audio_transcripts_txt.zip')
 
       toast.success('ZIP скачан', {
         description: `TXT файлов внутри архива: ${files.length}`
@@ -710,7 +746,7 @@ export function AudioTranscriberPageClient() {
               <Input
                 value={settings.model}
                 onChange={event => updateSetting('model', event.target.value)}
-                placeholder="fun-asr"
+                placeholder="fun-asr-flash-2026-06-15"
                 disabled={isProcessing}
               />
             </div>
@@ -721,12 +757,12 @@ export function AudioTranscriberPageClient() {
             <Input
               value={settings.apiUrl}
               onChange={event => updateSetting('apiUrl', event.target.value)}
-              placeholder="https://WORKSPACE_ID.ap-southeast-1.maas.aliyuncs.com/api/v1"
+              placeholder="https://WORKSPACE_ID.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
               disabled={isProcessing}
             />
             <p className="text-xs text-muted-foreground">
-              Для разделения говорящих используй base URL до /api/v1, не
-              /compatible-mode/v1 и не generation endpoint.
+              Для режима без OSS используй generation endpoint, не
+              /compatible-mode/v1.
             </p>
           </div>
 
@@ -766,8 +802,13 @@ export function AudioTranscriberPageClient() {
                 disabled={isProcessing}
                 className="h-4 w-4"
               />
-              Включить разделение говорящих
+              Пробовать оформлять текст по ролям
             </label>
+
+            <p className="mt-2 text-xs text-muted-foreground">
+              В режиме без OSS это не настоящее speaker_id-разделение. Это
+              только подсказка модели оформить текст как менеджер/клиент.
+            </p>
 
             <div className="mt-4 grid gap-4 md:grid-cols-3">
               <div className="space-y-2">
@@ -783,7 +824,7 @@ export function AudioTranscriberPageClient() {
               </div>
 
               <div className="space-y-2">
-                <Label>Speaker 0</Label>
+                <Label>Роль 1</Label>
                 <Input
                   value={settings.speaker0Role}
                   onChange={event =>
@@ -795,7 +836,7 @@ export function AudioTranscriberPageClient() {
               </div>
 
               <div className="space-y-2">
-                <Label>Speaker 1</Label>
+                <Label>Роль 2</Label>
                 <Input
                   value={settings.speaker1Role}
                   onChange={event =>
@@ -866,11 +907,15 @@ export function AudioTranscriberPageClient() {
 
             <Button
               variant="outline"
-              onClick={handleDownloadAllSeparateTxt}
+              onClick={handleDownloadZip}
               disabled={successCount === 0 || isZipCreating || isFolderSaving}
             >
-              <Download className="mr-2 h-4 w-4" />
-              Скачать все отдельными TXT
+              {isZipCreating ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <FileArchive className="mr-2 h-4 w-4" />
+              )}
+              {isZipCreating ? 'Создаю ZIP...' : 'Скачать все TXT одним ZIP'}
             </Button>
 
             <Button
@@ -883,20 +928,7 @@ export function AudioTranscriberPageClient() {
               ) : (
                 <FolderDown className="mr-2 h-4 w-4" />
               )}
-              Сохранить все в папку
-            </Button>
-
-            <Button
-              variant="outline"
-              onClick={handleDownloadZip}
-              disabled={successCount === 0 || isZipCreating || isFolderSaving}
-            >
-              {isZipCreating ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              ) : (
-                <FileArchive className="mr-2 h-4 w-4" />
-              )}
-              {isZipCreating ? 'Создаю ZIP...' : 'Скачать ZIP с TXT'}
+              Сохранить все отдельными TXT в папку
             </Button>
           </div>
 

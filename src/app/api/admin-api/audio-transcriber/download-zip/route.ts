@@ -70,7 +70,6 @@ export async function POST(request: Request) {
     const body = (await request
       .json()
       .catch(() => null)) as ZipRequestBody | null
-
     const files = body?.files ?? []
 
     if (!Array.isArray(files) || files.length === 0) {
@@ -80,18 +79,22 @@ export async function POST(request: Request) {
     const zip = new JSZip()
     const folder = zip.folder('transcripts')
     const usedNames = new Set<string>()
+    let addedCount = 0
 
     files.forEach((file, index) => {
       const text = String(file.text || '').trim()
 
-      if (!text) {
-        return
-      }
+      if (!text) return
 
       const fileName = createUniqueFileName(file.fileName, index, usedNames)
 
       folder?.file(fileName, text)
+      addedCount += 1
     })
+
+    if (addedCount === 0) {
+      throw new AppApiError(400, 'Нет непустых TXT файлов для ZIP архива')
+    }
 
     const buffer = await zip.generateAsync({
       type: 'nodebuffer',
