@@ -324,7 +324,7 @@ function createRoleContext(settings: SavedSettings) {
 
 const TRANSCRIBE_BATCH_SIZE = 50
 
-const BATCH_DELAY_MS = 10000
+const BATCH_DELAY_MS = 5000
 
 const RATE_LIMIT_RETRY_DELAYS_MS = [15000, 30000, 60000]
 
