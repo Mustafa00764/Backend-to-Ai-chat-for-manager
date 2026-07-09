@@ -27,10 +27,21 @@ const AUDIO_MIME_BY_EXTENSION: Record<string, string> = {
   mp4: 'video/mp4'
 }
 
+type FunAsrSentence = {
+  text?: string
+  speaker_id?: string | number
+  speakerId?: string | number
+  begin_time?: number
+  end_time?: number
+  beginTime?: number
+  endTime?: number
+}
+
 type FunAsrResponse = {
   output?: {
     text?: string
     sentence?: unknown
+    sentences?: unknown
   }
   usage?: unknown
   request_id?: string
@@ -115,6 +126,17 @@ function normalizeApiUrl(value: string) {
     throw new AppApiError(400, 'QWEN_API_URL должен начинаться с https://')
   }
 
+  if (url.pathname.includes('/compatible-mode')) {
+    throw new AppApiError(
+      400,
+      'Для Fun-ASR нельзя использовать /compatible-mode/v1. Нужен endpoint /api/v1/services/aigc/multimodal-generation/generation'
+    )
+  }
+
+  if (url.pathname === '/' || url.pathname === '') {
+    return `${cleanValue}/api/v1/services/aigc/multimodal-generation/generation`
+  }
+
   return cleanValue
 }
 
@@ -161,6 +183,100 @@ function createMessages(params: { dataUri: string; context: string }) {
   return messages
 }
 
+function toBoolean(value: FormDataEntryValue | null) {
+  return String(value || '').toLowerCase() === 'true'
+}
+
+function toPositiveNumber(value: string) {
+  const number = Number(value)
+
+  if (!Number.isFinite(number) || number <= 0) {
+    return null
+  }
+
+  return Math.floor(number)
+}
+
+function isSentenceArray(value: unknown): value is FunAsrSentence[] {
+  return Array.isArray(value)
+}
+
+function getSpeakerId(sentence: FunAsrSentence) {
+  const speakerId = sentence.speaker_id ?? sentence.speakerId
+
+  if (speakerId === null || speakerId === undefined || speakerId === '') {
+    return null
+  }
+
+  return String(speakerId)
+}
+
+function formatSentencesWithSpeakers(params: {
+  sentences: FunAsrSentence[]
+  speaker0Role: string
+  speaker1Role: string
+}) {
+  const speakerRoleMap: Record<string, string> = {
+    '0': params.speaker0Role || 'Speaker 0',
+    '1': params.speaker1Role || 'Speaker 1'
+  }
+
+  const lines: string[] = []
+
+  for (const sentence of params.sentences) {
+    const text = String(sentence.text || '').trim()
+
+    if (!text) {
+      continue
+    }
+
+    const speakerId = getSpeakerId(sentence)
+
+    if (!speakerId) {
+      lines.push(text)
+      continue
+    }
+
+    const role = speakerRoleMap[speakerId] || `Speaker ${speakerId}`
+
+    lines.push(`${role}: ${text}`)
+  }
+
+  return lines.join('\n').trim()
+}
+
+function extractTranscript(params: {
+  json: FunAsrResponse
+  speaker0Role: string
+  speaker1Role: string
+}) {
+  const rawSentences =
+    params.json.output?.sentence ?? params.json.output?.sentences
+
+  if (isSentenceArray(rawSentences) && rawSentences.length > 0) {
+    const sentenceText = formatSentencesWithSpeakers({
+      sentences: rawSentences,
+      speaker0Role: params.speaker0Role,
+      speaker1Role: params.speaker1Role
+    })
+
+    if (sentenceText) {
+      return sentenceText
+    }
+  }
+
+  const text = params.json.output?.text?.trim()
+
+  if (!text) {
+    throw new AppApiError(
+      502,
+      params.json.message || 'Fun-ASR не вернул текст расшифровки'
+    )
+  }
+
+  return text
+}
+
 async function callFunAsr(params: {
   apiUrl: string
   apiKey: string
@@ -169,6 +285,10 @@ async function callFunAsr(params: {
   format: string
   sampleRate: string
   context: string
+  diarizationEnabled: boolean
+  speakerCount: number | null
+  speaker0Role: string
+  speaker1Role: string
 }) {
   const controller = new AbortController()
 
@@ -185,6 +305,14 @@ async function callFunAsr(params: {
 
     if (params.sampleRate.trim()) {
       parameters.sample_rate = params.sampleRate.trim()
+    }
+
+    if (params.diarizationEnabled) {
+      parameters.diarization_enabled = true
+
+      if (params.speakerCount) {
+        parameters.speaker_count = params.speakerCount
+      }
     }
 
     const response = await fetch(params.apiUrl, {
@@ -226,19 +354,20 @@ async function callFunAsr(params: {
       )
     }
 
-    const text = json?.output?.text?.trim()
-
-    if (!text) {
-      throw new AppApiError(
-        502,
-        json?.message || 'Fun-ASR не вернул текст расшифровки'
-      )
+    if (!json) {
+      throw new AppApiError(502, 'Fun-ASR вернул пустой ответ')
     }
+
+    const text = extractTranscript({
+      json,
+      speaker0Role: params.speaker0Role,
+      speaker1Role: params.speaker1Role
+    })
 
     return {
       text,
-      usage: json?.usage ?? null,
-      requestId: json?.request_id ?? null,
+      usage: json.usage ?? null,
+      requestId: json.request_id ?? null,
       raw: json
     }
   } catch (error) {
@@ -265,8 +394,21 @@ export async function POST(request: Request) {
     const sampleRate = String(formData.get('sampleRate') || '').trim()
     const context = String(formData.get('context') || '').trim()
 
+    const diarizationEnabled = toBoolean(formData.get('diarizationEnabled'))
+    const speakerCount = toPositiveNumber(
+      String(formData.get('speakerCount') || '')
+    )
+    const speaker0Role = String(
+      formData.get('speaker0Role') || 'Менеджер'
+    ).trim()
+    const speaker1Role = String(formData.get('speaker1Role') || 'Клиент').trim()
+
     if (!apiKey) {
       throw new AppApiError(400, 'QWEN_API_KEY не передан')
+    }
+
+    if (!model) {
+      throw new AppApiError(400, 'Модель не передана')
     }
 
     if (!(file instanceof File)) {
@@ -287,7 +429,11 @@ export async function POST(request: Request) {
       file,
       format,
       sampleRate,
-      context
+      context,
+      diarizationEnabled,
+      speakerCount,
+      speaker0Role,
+      speaker1Role
     })
 
     return NextResponse.json({

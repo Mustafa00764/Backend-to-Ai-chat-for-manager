@@ -40,6 +40,10 @@ type SavedSettings = {
   model: string
   sampleRate: string
   context: string
+  diarizationEnabled: boolean
+  speakerCount: string
+  speaker0Role: string
+  speaker1Role: string
 }
 
 type TranscribeResponse = {
@@ -57,11 +61,15 @@ const STORAGE_KEY = 'fun-asr-audio-transcriber-settings'
 const DEFAULT_SETTINGS: SavedSettings = {
   apiKey: '',
   apiUrl:
-    'https://YOUR_WORKSPACE_ID.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
+    'https://ws-3m6rwjs94flv68ph.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
   model: 'fun-asr-flash-2026-06-15',
   sampleRate: '',
   context:
-    'Это телефонный разговор менеджера с клиентом. Тематика: профнастил, сэндвич-панели, металлочерепица, цена, доставка, сроки, заказ.'
+    'Это телефонный разговор менеджера с клиентом. Тематика: профнастил, сэндвич-панели, металлочерепица, цена, доставка, сроки, заказ.',
+  diarizationEnabled: false,
+  speakerCount: '2',
+  speaker0Role: 'Менеджер',
+  speaker1Role: 'Клиент'
 }
 
 const AUDIO_ACCEPT =
@@ -170,7 +178,7 @@ function sanitizeFileName(fileName: string) {
     .trim()
 }
 
-function createTxtFileName(fileName: string) {
+function createBaseTxtFileName(fileName: string) {
   const cleanFileName = sanitizeFileName(fileName)
   const dotIndex = cleanFileName.lastIndexOf('.')
 
@@ -181,18 +189,31 @@ function createTxtFileName(fileName: string) {
   return `${cleanFileName.slice(0, dotIndex)}.txt`
 }
 
+function createUniqueTxtFileName(
+  item: TranscribeItem,
+  index: number,
+  usedNames: Set<string>
+) {
+  const baseName = createBaseTxtFileName(item.file.name)
+  const dotIndex = baseName.lastIndexOf('.')
+  const nameWithoutExt =
+    dotIndex === -1 ? baseName : baseName.slice(0, dotIndex)
+
+  let candidate = baseName
+  let counter = 1
+
+  while (usedNames.has(candidate.toLowerCase())) {
+    candidate = `${nameWithoutExt}_${index + 1}_${counter}.txt`
+    counter += 1
+  }
+
+  usedNames.add(candidate.toLowerCase())
+
+  return candidate
+}
+
 function createTxtContent(item: TranscribeItem) {
-  return [
-    `Файл: ${item.file.name}`,
-    `Размер: ${formatFileSize(item.file.size)}`,
-    item.requestId ? `Request ID: ${item.requestId}` : null,
-    '',
-    'Текст:',
-    '',
-    item.text.trim()
-  ]
-    .filter(Boolean)
-    .join('\n')
+  return item.text.trim()
 }
 
 function downloadTextFile(fileName: string, text: string) {
@@ -205,11 +226,15 @@ function downloadTextFile(fileName: string, text: string) {
 
   link.href = url
   link.download = fileName
+  link.style.display = 'none'
+
   document.body.appendChild(link)
   link.click()
   link.remove()
 
-  URL.revokeObjectURL(url)
+  window.setTimeout(() => {
+    URL.revokeObjectURL(url)
+  }, 1000)
 }
 
 async function downloadBlob(fileName: string, blob: Blob) {
@@ -218,11 +243,15 @@ async function downloadBlob(fileName: string, blob: Blob) {
 
   link.href = url
   link.download = fileName
+  link.style.display = 'none'
+
   document.body.appendChild(link)
   link.click()
   link.remove()
 
-  URL.revokeObjectURL(url)
+  window.setTimeout(() => {
+    URL.revokeObjectURL(url)
+  }, 1000)
 }
 
 async function transcribeFile(params: { file: File; settings: SavedSettings }) {
@@ -234,6 +263,13 @@ async function transcribeFile(params: { file: File; settings: SavedSettings }) {
   formData.append('model', params.settings.model)
   formData.append('sampleRate', params.settings.sampleRate)
   formData.append('context', params.settings.context)
+  formData.append(
+    'diarizationEnabled',
+    String(params.settings.diarizationEnabled)
+  )
+  formData.append('speakerCount', params.settings.speakerCount)
+  formData.append('speaker0Role', params.settings.speaker0Role)
+  formData.append('speaker1Role', params.settings.speaker1Role)
 
   const response = await fetch('/api/admin-api/audio-transcriber/fun-asr', {
     method: 'POST',
@@ -364,7 +400,10 @@ export function AudioTranscriberPageClient() {
   }
 
   function handleDownloadItem(item: TranscribeItem) {
-    downloadTextFile(createTxtFileName(item.file.name), createTxtContent(item))
+    downloadTextFile(
+      createBaseTxtFileName(item.file.name),
+      createTxtContent(item)
+    )
   }
 
   function handleDownloadAllSeparateTxt() {
@@ -375,17 +414,20 @@ export function AudioTranscriberPageClient() {
       return
     }
 
+    const usedNames = new Set<string>()
+
     readyItems.forEach((item, index) => {
+      const fileName = createUniqueTxtFileName(item, index, usedNames)
+      const content = createTxtContent(item)
+
       window.setTimeout(() => {
-        downloadTextFile(
-          createTxtFileName(item.file.name),
-          createTxtContent(item)
-        )
-      }, index * 250)
+        downloadTextFile(fileName, content)
+      }, index * 600)
     })
 
-    toast.success('Скачивание TXT запущено', {
-      description: `Файлов: ${readyItems.length}`
+    toast.success('Скачивание отдельных TXT запущено', {
+      description:
+        'Если браузер заблокирует массовое скачивание, используй кнопку ZIP.'
     })
   }
 
@@ -402,13 +444,14 @@ export function AudioTranscriberPageClient() {
     try {
       const zip = new JSZip()
       const folder = zip.folder('transcripts')
+      const usedNames = new Set<string>()
 
-      for (const item of readyItems) {
-        const fileName = createTxtFileName(item.file.name)
+      readyItems.forEach((item, index) => {
+        const fileName = createUniqueTxtFileName(item, index, usedNames)
         const content = createTxtContent(item)
 
         folder?.file(fileName, content)
-      }
+      })
 
       const blob = await zip.generateAsync({
         type: 'blob',
@@ -587,11 +630,11 @@ export function AudioTranscriberPageClient() {
             <Input
               value={settings.apiUrl}
               onChange={event => updateSetting('apiUrl', event.target.value)}
-              placeholder="https://YOUR_WORKSPACE_ID.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+              placeholder="https://WORKSPACE_ID.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
               disabled={isProcessing}
             />
             <p className="text-xs text-muted-foreground">
-              Для Singapore обычно:
+              Для Singapore:
               https://WORKSPACE_ID.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
             </p>
           </div>
@@ -622,10 +665,70 @@ export function AudioTranscriberPageClient() {
                 className="min-h-24 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none placeholder:text-muted-foreground focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
               />
               <p className="text-xs text-muted-foreground">
-                Контекст помогает распознавать строительные термины. Лучше не
-                писать больше 400 символов.
+                Контекст помогает распознавать строительные термины.
               </p>
             </div>
+          </div>
+
+          <div className="rounded-lg border bg-muted/40 p-4">
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="flex cursor-pointer items-center gap-2 text-sm font-medium">
+                <input
+                  type="checkbox"
+                  checked={settings.diarizationEnabled}
+                  onChange={event =>
+                    updateSetting('diarizationEnabled', event.target.checked)
+                  }
+                  disabled={isProcessing}
+                  className="h-4 w-4"
+                />
+                Включить разделение говорящих
+              </label>
+            </div>
+
+            <div className="mt-4 grid gap-4 md:grid-cols-3">
+              <div className="space-y-2">
+                <Label>Количество говорящих</Label>
+                <Input
+                  value={settings.speakerCount}
+                  onChange={event =>
+                    updateSetting('speakerCount', event.target.value)
+                  }
+                  placeholder="2"
+                  disabled={isProcessing || !settings.diarizationEnabled}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label>Speaker 0</Label>
+                <Input
+                  value={settings.speaker0Role}
+                  onChange={event =>
+                    updateSetting('speaker0Role', event.target.value)
+                  }
+                  placeholder="Менеджер"
+                  disabled={isProcessing || !settings.diarizationEnabled}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label>Speaker 1</Label>
+                <Input
+                  value={settings.speaker1Role}
+                  onChange={event =>
+                    updateSetting('speaker1Role', event.target.value)
+                  }
+                  placeholder="Клиент"
+                  disabled={isProcessing || !settings.diarizationEnabled}
+                />
+              </div>
+            </div>
+
+            <p className="mt-3 text-xs text-muted-foreground">
+              Если Fun-ASR вернёт speaker_id, TXT будет оформлен как “Менеджер:
+              … / Клиент: …”. Если speaker_id не придёт, будет сохранён обычный
+              текст.
+            </p>
           </div>
 
           <Button
