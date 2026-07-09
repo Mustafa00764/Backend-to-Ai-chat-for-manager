@@ -446,6 +446,6 @@ export async function POST(request: Request) {
       requestId: result.requestId
     })
   } catch (error) {
-    return handleApiError(error)
+    return handleApiError(error) 
   }
 }
