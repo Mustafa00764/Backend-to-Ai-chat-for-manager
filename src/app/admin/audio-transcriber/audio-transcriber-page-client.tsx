@@ -322,7 +322,7 @@ function createRoleContext(settings: SavedSettings) {
     .join('\n')
 }
 
-const TRANSCRIBE_BATCH_SIZE = 50
+const TRANSCRIBE_BATCH_SIZE = 100
 
 const BATCH_DELAY_MS = 5000
 
