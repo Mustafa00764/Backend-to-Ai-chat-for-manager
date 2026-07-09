@@ -1,9 +1,11 @@
 'use client'
 
+import JSZip from 'jszip'
 import {
   CheckCircle2,
   Copy,
   Download,
+  FileArchive,
   FileAudio2,
   KeyRound,
   Loader2,
@@ -19,13 +21,6 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue
-} from '@/components/ui/select'
 
 type FileStatus = 'queued' | 'processing' | 'success' | 'error'
 
@@ -168,14 +163,22 @@ function getStatusVariant(status: FileStatus) {
   return 'secondary'
 }
 
+function sanitizeFileName(fileName: string) {
+  return fileName
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 function createTxtFileName(fileName: string) {
-  const dotIndex = fileName.lastIndexOf('.')
+  const cleanFileName = sanitizeFileName(fileName)
+  const dotIndex = cleanFileName.lastIndexOf('.')
 
   if (dotIndex === -1) {
-    return `${fileName}.txt`
+    return `${cleanFileName}.txt`
   }
 
-  return `${fileName.slice(0, dotIndex)}.txt`
+  return `${cleanFileName.slice(0, dotIndex)}.txt`
 }
 
 function createTxtContent(item: TranscribeItem) {
@@ -197,6 +200,19 @@ function downloadTextFile(fileName: string, text: string) {
     type: 'text/plain;charset=utf-8'
   })
 
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+
+  link.href = url
+  link.download = fileName
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+
+  URL.revokeObjectURL(url)
+}
+
+async function downloadBlob(fileName: string, blob: Blob) {
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
 
@@ -247,6 +263,7 @@ export function AudioTranscriberPageClient() {
   const [settings, setSettings] = useState<SavedSettings>(DEFAULT_SETTINGS)
   const [items, setItems] = useState<TranscribeItem[]>([])
   const [isProcessing, setIsProcessing] = useState(false)
+  const [isZipCreating, setIsZipCreating] = useState(false)
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -272,6 +289,10 @@ export function AudioTranscriberPageClient() {
       ...prev,
       [key]: value
     }))
+  }
+
+  function getReadyItems() {
+    return items.filter(item => item.status === 'success' && item.text.trim())
   }
 
   function handleSaveSettings() {
@@ -324,7 +345,7 @@ export function AudioTranscriberPageClient() {
   }
 
   function handleClearFiles() {
-    if (isProcessing) return
+    if (isProcessing || isZipCreating) return
 
     setItems([])
 
@@ -346,21 +367,67 @@ export function AudioTranscriberPageClient() {
     downloadTextFile(createTxtFileName(item.file.name), createTxtContent(item))
   }
 
-  function handleDownloadAllAsOneFile() {
-    const readyItems = items.filter(
-      item => item.status === 'success' && item.text.trim()
-    )
+  function handleDownloadAllSeparateTxt() {
+    const readyItems = getReadyItems()
 
     if (readyItems.length === 0) {
       toast.error('Нет готовых текстов')
       return
     }
 
-    const content = readyItems
-      .map(item => createTxtContent(item))
-      .join('\n\n----------------------------------------\n\n')
+    readyItems.forEach((item, index) => {
+      window.setTimeout(() => {
+        downloadTextFile(
+          createTxtFileName(item.file.name),
+          createTxtContent(item)
+        )
+      }, index * 250)
+    })
 
-    downloadTextFile('all_transcripts.txt', content)
+    toast.success('Скачивание TXT запущено', {
+      description: `Файлов: ${readyItems.length}`
+    })
+  }
+
+  async function handleDownloadZip() {
+    const readyItems = getReadyItems()
+
+    if (readyItems.length === 0) {
+      toast.error('Нет готовых текстов')
+      return
+    }
+
+    setIsZipCreating(true)
+
+    try {
+      const zip = new JSZip()
+      const folder = zip.folder('transcripts')
+
+      for (const item of readyItems) {
+        const fileName = createTxtFileName(item.file.name)
+        const content = createTxtContent(item)
+
+        folder?.file(fileName, content)
+      }
+
+      const blob = await zip.generateAsync({
+        type: 'blob',
+        compression: 'DEFLATE',
+        compressionOptions: {
+          level: 6
+        }
+      })
+
+      await downloadBlob('audio_transcripts_txt.zip', blob)
+
+      toast.success('ZIP создан', {
+        description: `TXT файлов внутри архива: ${readyItems.length}`
+      })
+    } catch {
+      toast.error('Не удалось создать ZIP архив')
+    } finally {
+      setIsZipCreating(false)
+    }
   }
 
   async function handleStart() {
@@ -371,6 +438,11 @@ export function AudioTranscriberPageClient() {
 
     if (!settings.apiUrl.trim()) {
       toast.error('Введи QWEN_API_URL')
+      return
+    }
+
+    if (!settings.model.trim()) {
+      toast.error('Введи название модели')
       return
     }
 
@@ -480,7 +552,7 @@ export function AudioTranscriberPageClient() {
         </CardHeader>
 
         <CardContent className="space-y-4">
-          <div className="grid gap-4 md:grid-cols-[1fr_220px]">
+          <div className="grid gap-4 md:grid-cols-[1fr_360px]">
             <div className="space-y-2">
               <Label>QWEN_API_KEY</Label>
               <Input
@@ -498,30 +570,14 @@ export function AudioTranscriberPageClient() {
 
             <div className="space-y-2">
               <Label>Модель</Label>
-              <Select
+              <Input
                 value={settings.model}
-                onValueChange={value => {
-                  if (!value) return
-
-                  updateSetting('model', value)
-                }}
+                onChange={event => updateSetting('model', event.target.value)}
+                placeholder="Например: fun-asr-flash-2026-06-15"
                 disabled={isProcessing}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="fun-asr-flash-2026-06-15">
-                    fun-asr-flash-2026-06-15
-                  </SelectItem>
-                  <SelectItem value="fun-asr-flash">fun-asr-flash</SelectItem>
-                  <SelectItem value="fun-asr-realtime">
-                    fun-asr-realtime
-                  </SelectItem>
-                </SelectContent>
-              </Select>
+              />
               <p className="text-xs text-muted-foreground">
-                Для этой страницы лучше использовать fun-asr-flash-2026-06-15.
+                Можно вписать любую модель вручную.
               </p>
             </div>
           </div>
@@ -627,18 +683,31 @@ export function AudioTranscriberPageClient() {
             <Button
               variant="outline"
               onClick={handleClearFiles}
-              disabled={isProcessing}
+              disabled={isProcessing || isZipCreating}
             >
               Очистить список
             </Button>
 
             <Button
               variant="outline"
-              onClick={handleDownloadAllAsOneFile}
-              disabled={successCount === 0}
+              onClick={handleDownloadAllSeparateTxt}
+              disabled={successCount === 0 || isZipCreating}
             >
               <Download className="mr-2 h-4 w-4" />
-              Скачать все одним TXT
+              Скачать все отдельными TXT
+            </Button>
+
+            <Button
+              variant="outline"
+              onClick={handleDownloadZip}
+              disabled={successCount === 0 || isZipCreating}
+            >
+              {isZipCreating ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <FileArchive className="mr-2 h-4 w-4" />
+              )}
+              {isZipCreating ? 'Создаю ZIP...' : 'Скачать ZIP с TXT'}
             </Button>
           </div>
 
