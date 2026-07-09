@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { NextResponse } from 'next/server'
 
@@ -113,7 +114,7 @@ function getScriptPath() {
 }
 
 async function saveTempAudioFile(file: File) {
-  const tempDir = path.join(process.cwd(), '.tmp', 'fun-asr-audio')
+  const tempDir = path.join(os.tmpdir(), 'fun-asr-audio')
   const extension = getFileExtension(file.name) || '.audio'
   const filePath = path.join(tempDir, `${randomUUID()}${extension}`)
 
