@@ -5,14 +5,14 @@ import { requireAdmin } from '@/lib/auth/current-user'
 
 export const runtime = 'nodejs'
 
-const DEFAULT_MODEL = 'fun-asr-flash-2026-06-15'
+const DEFAULT_MODEL = 'qwen3-asr-flash'
 
 const MAX_AUDIO_FILE_SIZE_MB = Number(
-  process.env.FUN_ASR_MAX_AUDIO_FILE_SIZE_MB || '25'
+  process.env.QWEN3_ASR_MAX_AUDIO_FILE_SIZE_MB || '7'
 )
 
 const REQUEST_TIMEOUT_MS = Number(
-  process.env.FUN_ASR_REQUEST_TIMEOUT_MS || String(15 * 60 * 1000)
+  process.env.QWEN3_ASR_REQUEST_TIMEOUT_MS || String(10 * 60 * 1000)
 )
 
 const AUDIO_MIME_BY_EXTENSION: Record<string, string> = {
@@ -27,44 +27,38 @@ const AUDIO_MIME_BY_EXTENSION: Record<string, string> = {
   mp4: 'video/mp4'
 }
 
-type FunAsrResponse = {
-  output?: {
-    text?: string
-    output?: {
-      sentence?: {
-        text?: string
-      }
+type QwenAsrResponse = {
+  id?: string
+  model?: string
+  choices?: Array<{
+    message?: {
+      content?: string
+      annotations?: unknown
     }
-    sentence?: {
-      text?: string
-    }
-  }
+  }>
   usage?: unknown
   request_id?: string
   code?: string
   message?: string
+  error?: {
+    message?: string
+  }
 }
 
 function getFileExtension(fileName: string) {
   const dotIndex = fileName.lastIndexOf('.')
-  if (dotIndex === -1) return ''
+
+  if (dotIndex === -1) {
+    return ''
+  }
+
   return fileName.slice(dotIndex + 1).toLowerCase()
 }
 
-function getAudioFormat(fileName: string, fallbackFormat: string) {
-  const cleanFallback = fallbackFormat.trim().toLowerCase()
-  if (cleanFallback) return cleanFallback
-
-  const extension = getFileExtension(fileName)
-
-  if (extension === 'm4a') return 'mp4'
-  if (extension === 'webm') return 'opus'
-
-  return extension || 'mp3'
-}
-
 function getMimeType(file: File) {
-  if (file.type) return file.type
+  if (file.type) {
+    return file.type
+  }
 
   const extension = getFileExtension(file.name)
 
@@ -89,43 +83,46 @@ function assertAudioFile(file: File) {
   if (file.size > maxBytes) {
     throw new AppApiError(
       413,
-      `Файл слишком большой. Максимум: ${MAX_AUDIO_FILE_SIZE_MB} MB`
+      `Файл слишком большой для qwen3-asr-flash. Максимум: ${MAX_AUDIO_FILE_SIZE_MB} MB. Для длинных аудио нужна filetrans/Fun-ASR async.`
     )
   }
 }
 
-function normalizeApiUrl(value: string) {
+function normalizeCompatibleBaseUrl(value: string) {
   const cleanValue = value.trim().replace(/\/+$/, '')
 
   if (!cleanValue) {
     throw new AppApiError(400, 'QWEN_API_URL не передан')
   }
 
-  const url = new URL(cleanValue)
+  let url: URL
+
+  try {
+    url = new URL(cleanValue)
+  } catch {
+    throw new AppApiError(400, 'Некорректный QWEN_API_URL')
+  }
 
   if (url.protocol !== 'https:') {
     throw new AppApiError(400, 'QWEN_API_URL должен начинаться с https://')
   }
 
-  if (url.pathname.includes('/compatible-mode')) {
-    throw new AppApiError(
-      400,
-      'Для этого режима нельзя использовать /compatible-mode/v1. Нужен endpoint /api/v1/services/aigc/multimodal-generation/generation'
-    )
+  if (url.pathname.includes('/compatible-mode/v1/chat/completions')) {
+    return cleanValue.replace(/\/chat\/completions$/, '')
   }
 
-  if (url.pathname === '/' || url.pathname === '') {
-    return `${cleanValue}/api/v1/services/aigc/multimodal-generation/generation`
+  if (url.pathname.includes('/compatible-mode/v1')) {
+    return `${url.origin}/compatible-mode/v1`
   }
 
-  if (url.pathname.endsWith('/api/v1')) {
-    return `${cleanValue}/services/aigc/multimodal-generation/generation`
-  }
-
-  return cleanValue
+  return `${url.origin}/compatible-mode/v1`
 }
 
-async function fileToDataUri(file: File) {
+function createChatCompletionsUrl(baseUrl: string) {
+  return `${baseUrl}/chat/completions`
+}
+
+async function fileToDataUrl(file: File) {
   const mimeType = getMimeType(file)
   const buffer = Buffer.from(await file.arrayBuffer())
   const base64 = buffer.toString('base64')
@@ -133,65 +130,27 @@ async function fileToDataUri(file: File) {
   return `data:${mimeType};base64,${base64}`
 }
 
-function createMessages(params: { dataUri: string; context: string }) {
-  const messages: Array<{
-    role: 'user'
-    content: Array<Record<string, unknown>>
-  }> = []
-
-  const context = params.context.trim().slice(0, 600)
-
-  if (context) {
-    messages.push({
-      role: 'user',
-      content: [
-        {
-          type: 'input_text',
-          text: context
-        }
-      ]
-    })
-  }
-
-  messages.push({
-    role: 'user',
-    content: [
-      {
-        type: 'input_audio',
-        input_audio: {
-          data: params.dataUri
-        }
-      }
-    ]
-  })
-
-  return messages
-}
-
-function extractText(json: FunAsrResponse | null) {
-  const text =
-    json?.output?.text?.trim() ||
-    json?.output?.output?.sentence?.text?.trim() ||
-    json?.output?.sentence?.text?.trim()
+function extractText(json: QwenAsrResponse | null) {
+  const text = json?.choices?.[0]?.message?.content?.trim()
 
   if (!text) {
     throw new AppApiError(
-      502,
-      json?.message || 'Fun-ASR не вернул текст расшифровки'
+      422,
+      json?.message ||
+        json?.error?.message ||
+        'qwen3-asr-flash вернул пустой текст. Проверь, что аудио короче 5 минут, файл не битый и формат поддерживается.'
     )
   }
 
   return text
 }
 
-async function callFunAsr(params: {
+async function callQwen3Asr(params: {
   apiUrl: string
   apiKey: string
   model: string
   file: File
-  format: string
-  sampleRate: string
-  context: string
+  language: string
 }) {
   const controller = new AbortController()
 
@@ -200,42 +159,46 @@ async function callFunAsr(params: {
   }, REQUEST_TIMEOUT_MS)
 
   try {
-    const dataUri = await fileToDataUri(params.file)
+    const baseUrl = normalizeCompatibleBaseUrl(params.apiUrl)
+    const endpoint = createChatCompletionsUrl(baseUrl)
+    const audioDataUrl = await fileToDataUrl(params.file)
 
-    const parameters: Record<string, unknown> = {
-      format: params.format
-    }
-
-    if (params.sampleRate.trim()) {
-      parameters.sample_rate = params.sampleRate.trim()
-    }
-
-    const response = await fetch(params.apiUrl, {
+    const response = await fetch(endpoint, {
       method: 'POST',
       signal: controller.signal,
       headers: {
         Authorization: `Bearer ${params.apiKey}`,
-        'Content-Type': 'application/json',
-        'X-DashScope-SSE': 'disable'
+        'Content-Type': 'application/json'
       },
       body: JSON.stringify({
         model: params.model,
-        input: {
-          messages: createMessages({
-            dataUri,
-            context: params.context
-          })
-        },
-        parameters
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'input_audio',
+                input_audio: {
+                  data: audioDataUrl
+                }
+              }
+            ]
+          }
+        ],
+        stream: false,
+        asr_options: {
+          language: params.language || 'ru',
+          enable_itn: false
+        }
       })
     })
 
     const rawText = await response.text()
 
-    let json: FunAsrResponse | null = null
+    let json: QwenAsrResponse | null = null
 
     try {
-      json = JSON.parse(rawText) as FunAsrResponse
+      json = JSON.parse(rawText) as QwenAsrResponse
     } catch {
       json = null
     }
@@ -244,8 +207,9 @@ async function callFunAsr(params: {
       throw new AppApiError(
         response.status,
         json?.message ||
+          json?.error?.message ||
           rawText ||
-          `Ошибка Fun-ASR: ${response.status} ${response.statusText}`
+          `Ошибка qwen3-asr-flash: ${response.status} ${response.statusText}`
       )
     }
 
@@ -254,11 +218,14 @@ async function callFunAsr(params: {
     return {
       text,
       usage: json?.usage ?? null,
-      requestId: json?.request_id ?? null
+      requestId: json?.id || json?.request_id || null
     }
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
-      throw new AppApiError(408, 'Fun-ASR слишком долго обрабатывал аудио')
+      throw new AppApiError(
+        408,
+        'qwen3-asr-flash слишком долго обрабатывал аудио'
+      )
     }
 
     throw error
@@ -275,13 +242,16 @@ export async function POST(request: Request) {
 
     const file = formData.get('file')
     const apiKey = String(formData.get('apiKey') || '').trim()
-    const apiUrl = normalizeApiUrl(String(formData.get('apiUrl') || ''))
+    const apiUrl = String(formData.get('apiUrl') || '').trim()
     const model = String(formData.get('model') || DEFAULT_MODEL).trim()
-    const sampleRate = String(formData.get('sampleRate') || '').trim()
-    const context = String(formData.get('context') || '').trim()
+    const language = String(formData.get('language') || 'ru').trim()
 
     if (!apiKey) {
       throw new AppApiError(400, 'QWEN_API_KEY не передан')
+    }
+
+    if (!apiUrl) {
+      throw new AppApiError(400, 'QWEN_API_URL не передан')
     }
 
     if (!model) {
@@ -294,26 +264,19 @@ export async function POST(request: Request) {
 
     assertAudioFile(file)
 
-    const format = getAudioFormat(
-      file.name,
-      String(formData.get('format') || '')
-    )
-
-    const result = await callFunAsr({
+    const result = await callQwen3Asr({
       apiUrl,
       apiKey,
       model,
       file,
-      format,
-      sampleRate,
-      context
+      language
     })
 
     return NextResponse.json({
       fileName: file.name,
       sizeBytes: file.size,
       model,
-      format,
+      format: getFileExtension(file.name) || null,
       text: result.text,
       usage: result.usage,
       requestId: result.requestId
