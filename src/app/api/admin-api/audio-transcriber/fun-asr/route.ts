@@ -115,18 +115,6 @@ function normalizeApiUrl(value: string) {
     throw new AppApiError(400, 'QWEN_API_URL должен начинаться с https://')
   }
 
-  const allowedHost =
-    url.hostname.endsWith('.maas.aliyuncs.com') ||
-    url.hostname === 'dashscope.aliyuncs.com' ||
-    url.hostname === 'dashscope-intl.aliyuncs.com'
-
-  if (!allowedHost) {
-    throw new AppApiError(
-      400,
-      'Разрешены только Alibaba/Qwen endpoints: *.maas.aliyuncs.com, dashscope.aliyuncs.com или dashscope-intl.aliyuncs.com'
-    )
-  }
-
   return cleanValue
 }
 
