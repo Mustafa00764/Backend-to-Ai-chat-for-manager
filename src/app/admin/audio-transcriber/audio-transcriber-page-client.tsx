@@ -322,6 +322,75 @@ function createRoleContext(settings: SavedSettings) {
     .join('\n')
 }
 
+const TRANSCRIBE_BATCH_SIZE = 50
+
+const BATCH_DELAY_MS = 10000
+
+const RATE_LIMIT_RETRY_DELAYS_MS = [15000, 30000, 60000]
+
+function sleep(ms: number) {
+  return new Promise<void>(resolve => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
+function isRateLimitError(message: string) {
+  return /rate limit|rate-limit|requests rate limit exceeded|too many requests|429|throttl/i.test(
+    message.toLowerCase()
+  )
+}
+
+function chunkArray<T>(array: T[], size: number) {
+  const chunks: T[][] = []
+
+  for (let index = 0; index < array.length; index += size) {
+    chunks.push(array.slice(index, index + size))
+  }
+
+  return chunks
+}
+
+async function transcribeFileWithRetry(params: {
+  file: File
+  settings: SavedSettings
+  onRetry?: (attempt: number, delayMs: number, message: string) => void
+}) {
+  let lastError: Error | null = null
+
+  for (
+    let attempt = 0;
+    attempt <= RATE_LIMIT_RETRY_DELAYS_MS.length;
+    attempt += 1
+  ) {
+    try {
+      return await transcribeFile({
+        file: params.file,
+        settings: params.settings
+      })
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Не удалось распознать аудио'
+
+      lastError = new Error(message)
+
+      const shouldRetry =
+        isRateLimitError(message) && attempt < RATE_LIMIT_RETRY_DELAYS_MS.length
+
+      if (!shouldRetry) {
+        throw lastError
+      }
+
+      const delayMs = RATE_LIMIT_RETRY_DELAYS_MS[attempt]
+
+      params.onRetry?.(attempt + 1, delayMs, message)
+
+      await sleep(delayMs + Math.floor(Math.random() * 3000))
+    }
+  }
+
+  throw lastError || new Error('Не удалось распознать аудио')
+}
+
 async function transcribeFile(params: { file: File; settings: SavedSettings }) {
   const formData = new FormData()
 
@@ -605,7 +674,6 @@ export function AudioTranscriberPageClient() {
       setIsFolderSaving(false)
     }
   }
-
   async function handleStart() {
     if (!settings.apiKey.trim()) {
       toast.error('Введи QWEN_API_KEY')
@@ -635,60 +703,108 @@ export function AudioTranscriberPageClient() {
     for (const item of itemsToProcess) {
       updateItem(item.id, current => ({
         ...current,
-        status: 'processing',
-        progress: 15,
+        status: 'queued',
+        progress: 0,
         error: undefined,
         text: ''
       }))
     }
 
-    const results = await Promise.all(
-      itemsToProcess.map(async item => {
-        try {
-          updateItem(item.id, current => ({
-            ...current,
-            progress: 45
-          }))
+    const results: Array<{
+      status: 'success' | 'error'
+      item: TranscribeItem
+      error?: string
+    }> = []
 
-          const result = await transcribeFile({
-            file: item.file,
-            settings
-          })
+    const batches = chunkArray(itemsToProcess, TRANSCRIBE_BATCH_SIZE)
 
-          updateItem(item.id, current => ({
-            ...current,
-            status: 'success',
-            progress: 100,
-            text: result.text,
-            requestId: result.requestId,
-            taskId: result.taskId ?? null
-          }))
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+      const batch = batches[batchIndex]
 
-          return {
-            status: 'success' as const,
-            item
-          }
-        } catch (error) {
-          const message =
-            error instanceof Error
-              ? error.message
-              : 'Не удалось распознать аудио'
-
-          updateItem(item.id, current => ({
-            ...current,
-            status: 'error',
-            progress: 0,
-            error: message
-          }))
-
-          return {
-            status: 'error' as const,
-            item,
-            error: message
-          }
-        }
+      toast.info(`Запущена пачка ${batchIndex + 1} из ${batches.length}`, {
+        description: `Файлов в пачке: ${batch.length}`
       })
-    )
+
+      for (const item of batch) {
+        updateItem(item.id, current => ({
+          ...current,
+          status: 'processing',
+          progress: 20,
+          error: undefined
+        }))
+      }
+
+      const batchResults = await Promise.all(
+        batch.map(async item => {
+          try {
+            updateItem(item.id, current => ({
+              ...current,
+              progress: 45
+            }))
+
+            const result = await transcribeFileWithRetry({
+              file: item.file,
+              settings,
+              onRetry: (attempt, delayMs) => {
+                updateItem(item.id, current => ({
+                  ...current,
+                  status: 'processing',
+                  progress: 55,
+                  error: `Rate limit. Повтор ${attempt} через ${Math.ceil(
+                    delayMs / 1000
+                  )} сек.`
+                }))
+              }
+            })
+
+            updateItem(item.id, current => ({
+              ...current,
+              status: 'success',
+              progress: 100,
+              text: result.text,
+              error: undefined,
+              requestId: result.requestId,
+              taskId: result.taskId ?? null
+            }))
+
+            return {
+              status: 'success' as const,
+              item
+            }
+          } catch (error) {
+            const message =
+              error instanceof Error
+                ? error.message
+                : 'Не удалось распознать аудио'
+
+            updateItem(item.id, current => ({
+              ...current,
+              status: 'error',
+              progress: 0,
+              error: message
+            }))
+
+            return {
+              status: 'error' as const,
+              item,
+              error: message
+            }
+          }
+        })
+      )
+
+      results.push(...batchResults)
+
+      const hasNextBatch = batchIndex < batches.length - 1
+
+      if (hasNextBatch) {
+        toast.info('Пауза перед следующей пачкой', {
+          description: `${Math.ceil(BATCH_DELAY_MS / 1000)} сек.`
+        })
+
+        await sleep(BATCH_DELAY_MS)
+      }
+    }
 
     setIsProcessing(false)
 
@@ -894,7 +1010,7 @@ export function AudioTranscriberPageClient() {
               )}
               {isProcessing
                 ? `Обработка... активных: ${processingCount}`
-                : `Конвертировать все одновременно: ${items.length}`}
+                : `Конвертировать пачками по 50: ${items.length}`}
             </Button>
 
             <Button
