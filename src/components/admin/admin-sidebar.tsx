@@ -3,6 +3,7 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import {
+  AudioLines,
   Bot,
   Code2,
   Database,
@@ -19,6 +20,11 @@ const navItems = [
     href: '/admin',
     label: 'Dashboard',
     icon: LayoutDashboard
+  },
+  {
+    href: '/admin/audio-transcriber',
+    label: 'Audio transcription',
+    icon: AudioLines
   },
   {
     href: '/admin/users',
