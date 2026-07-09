@@ -1,3 +1,7 @@
+import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
+import path from 'node:path'
 import { NextResponse } from 'next/server'
 
 import { AppApiError, handleApiError } from '@/lib/api/api-error'
@@ -5,93 +9,50 @@ import { requireAdmin } from '@/lib/auth/current-user'
 
 export const runtime = 'nodejs'
 
-const DEFAULT_MODEL = 'fun-asr-flash-2026-06-15'
-
 const MAX_AUDIO_FILE_SIZE_MB = Number(
-  process.env.FUN_ASR_MAX_AUDIO_FILE_SIZE_MB || '25'
+  process.env.FUN_ASR_MAX_AUDIO_FILE_SIZE_MB || '500'
 )
 
 const REQUEST_TIMEOUT_MS = Number(
-  process.env.FUN_ASR_REQUEST_TIMEOUT_MS || String(15 * 60 * 1000)
+  process.env.FUN_ASR_REQUEST_TIMEOUT_MS || String(60 * 60 * 1000)
 )
 
-const AUDIO_MIME_BY_EXTENSION: Record<string, string> = {
-  mp3: 'audio/mpeg',
-  wav: 'audio/wav',
-  m4a: 'audio/mp4',
-  aac: 'audio/aac',
-  ogg: 'audio/ogg',
-  opus: 'audio/opus',
-  flac: 'audio/flac',
-  webm: 'audio/webm',
-  mp4: 'video/mp4'
-}
+const AUDIO_EXTENSIONS = new Set([
+  '.mp3',
+  '.wav',
+  '.m4a',
+  '.aac',
+  '.ogg',
+  '.opus',
+  '.flac',
+  '.webm',
+  '.mp4'
+])
 
-type FunAsrSentence = {
+type PythonResult = {
+  ok: boolean
   text?: string
-  speaker_id?: string | number
-  speakerId?: string | number
-  begin_time?: number
-  end_time?: number
-  beginTime?: number
-  endTime?: number
-}
-
-type FunAsrResponse = {
-  output?: {
-    text?: string
-    sentence?: unknown
-    sentences?: unknown
-  }
-  usage?: unknown
-  request_id?: string
-  code?: string
-  message?: string
+  error?: string
+  taskId?: string
+  requestId?: string | null
+  traceback?: string
 }
 
 function getFileExtension(fileName: string) {
   const dotIndex = fileName.lastIndexOf('.')
 
-  if (dotIndex === -1) {
-    return ''
-  }
+  if (dotIndex === -1) return ''
 
-  return fileName.slice(dotIndex + 1).toLowerCase()
-}
-
-function getAudioFormat(fileName: string, fallbackFormat: string) {
-  const cleanFallback = fallbackFormat.trim().toLowerCase()
-
-  if (cleanFallback) {
-    return cleanFallback
-  }
-
-  const extension = getFileExtension(fileName)
-
-  if (extension === 'm4a') return 'mp4'
-  if (extension === 'webm') return 'opus'
-
-  return extension || 'mp3'
-}
-
-function getMimeType(file: File) {
-  if (file.type) {
-    return file.type
-  }
-
-  const extension = getFileExtension(file.name)
-
-  return AUDIO_MIME_BY_EXTENSION[extension] || 'audio/mpeg'
+  return fileName.slice(dotIndex).toLowerCase()
 }
 
 function assertAudioFile(file: File) {
-  const mimeType = getMimeType(file)
   const extension = getFileExtension(file.name)
 
   const isAudio =
-    mimeType.startsWith('audio/') ||
-    mimeType === 'video/mp4' ||
-    extension in AUDIO_MIME_BY_EXTENSION
+    file.type.startsWith('audio/') ||
+    file.type === 'video/mp4' ||
+    AUDIO_EXTENSIONS.has(extension)
 
   if (!isAudio) {
     throw new AppApiError(400, 'Разрешены только аудиофайлы')
@@ -107,7 +68,7 @@ function assertAudioFile(file: File) {
   }
 }
 
-function normalizeApiUrl(value: string) {
+function normalizeBaseApiUrl(value: string) {
   const cleanValue = value.trim().replace(/\/+$/, '')
 
   if (!cleanValue) {
@@ -129,259 +90,125 @@ function normalizeApiUrl(value: string) {
   if (url.pathname.includes('/compatible-mode')) {
     throw new AppApiError(
       400,
-      'Для Fun-ASR нельзя использовать /compatible-mode/v1. Нужен endpoint /api/v1/services/aigc/multimodal-generation/generation'
+      'Для Fun-ASR diarization нельзя использовать /compatible-mode/v1. Укажи base URL вида https://WORKSPACE_ID.ap-southeast-1.maas.aliyuncs.com/api/v1'
     )
   }
 
-  if (url.pathname === '/' || url.pathname === '') {
-    return `${cleanValue}/api/v1/services/aigc/multimodal-generation/generation`
+  const apiV1Index = url.pathname.indexOf('/api/v1')
+
+  if (apiV1Index !== -1) {
+    const basePath = url.pathname.slice(0, apiV1Index + '/api/v1'.length)
+    return `${url.origin}${basePath}`
   }
 
-  return cleanValue
+  return `${url.origin}/api/v1`
 }
 
-async function fileToDataUri(file: File) {
-  const mimeType = getMimeType(file)
-  const buffer = Buffer.from(await file.arrayBuffer())
-  const base64 = buffer.toString('base64')
-
-  return `data:${mimeType};base64,${base64}`
+function getPythonCommand() {
+  return process.env.PYTHON_BIN || 'python3'
 }
 
-function createMessages(params: { dataUri: string; context: string }) {
-  const messages: Array<{
-    role: 'user'
-    content: Array<Record<string, unknown>>
-  }> = []
+function getScriptPath() {
+  return path.join(process.cwd(), 'scripts', 'fun_asr_transcribe.py')
+}
 
-  const context = params.context.trim().slice(0, 400)
+async function saveTempAudioFile(file: File) {
+  const tempDir = path.join(process.cwd(), '.tmp', 'fun-asr-audio')
+  const extension = getFileExtension(file.name) || '.audio'
+  const filePath = path.join(tempDir, `${randomUUID()}${extension}`)
 
-  if (context) {
-    messages.push({
-      role: 'user',
-      content: [
-        {
-          type: 'input_text',
-          text: context
-        }
-      ]
-    })
-  }
-
-  messages.push({
-    role: 'user',
-    content: [
-      {
-        type: 'input_audio',
-        input_audio: {
-          data: params.dataUri
-        }
-      }
-    ]
+  await mkdir(tempDir, {
+    recursive: true
   })
 
-  return messages
+  const buffer = Buffer.from(await file.arrayBuffer())
+
+  await writeFile(filePath, buffer)
+
+  return filePath
 }
 
-function toBoolean(value: FormDataEntryValue | null) {
-  return String(value || '').toLowerCase() === 'true'
-}
+function parsePythonResult(stdout: string) {
+  const lines = stdout
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
 
-function toPositiveNumber(value: string) {
-  const number = Number(value)
-
-  if (!Number.isFinite(number) || number <= 0) {
-    return null
-  }
-
-  return Math.floor(number)
-}
-
-function isSentenceArray(value: unknown): value is FunAsrSentence[] {
-  return Array.isArray(value)
-}
-
-function getSpeakerId(sentence: FunAsrSentence) {
-  const speakerId = sentence.speaker_id ?? sentence.speakerId
-
-  if (speakerId === null || speakerId === undefined || speakerId === '') {
-    return null
-  }
-
-  return String(speakerId)
-}
-
-function formatSentencesWithSpeakers(params: {
-  sentences: FunAsrSentence[]
-  speaker0Role: string
-  speaker1Role: string
-}) {
-  const speakerRoleMap: Record<string, string> = {
-    '0': params.speaker0Role || 'Speaker 0',
-    '1': params.speaker1Role || 'Speaker 1'
-  }
-
-  const lines: string[] = []
-
-  for (const sentence of params.sentences) {
-    const text = String(sentence.text || '').trim()
-
-    if (!text) {
-      continue
-    }
-
-    const speakerId = getSpeakerId(sentence)
-
-    if (!speakerId) {
-      lines.push(text)
-      continue
-    }
-
-    const role = speakerRoleMap[speakerId] || `Speaker ${speakerId}`
-
-    lines.push(`${role}: ${text}`)
-  }
-
-  return lines.join('\n').trim()
-}
-
-function extractTranscript(params: {
-  json: FunAsrResponse
-  speaker0Role: string
-  speaker1Role: string
-}) {
-  const rawSentences =
-    params.json.output?.sentence ?? params.json.output?.sentences
-
-  if (isSentenceArray(rawSentences) && rawSentences.length > 0) {
-    const sentenceText = formatSentencesWithSpeakers({
-      sentences: rawSentences,
-      speaker0Role: params.speaker0Role,
-      speaker1Role: params.speaker1Role
-    })
-
-    if (sentenceText) {
-      return sentenceText
-    }
-  }
-
-  const text = params.json.output?.text?.trim()
-
-  if (!text) {
-    throw new AppApiError(
-      502,
-      params.json.message || 'Fun-ASR не вернул текст расшифровки'
-    )
-  }
-
-  return text
-}
-
-async function callFunAsr(params: {
-  apiUrl: string
-  apiKey: string
-  model: string
-  file: File
-  format: string
-  sampleRate: string
-  context: string
-  diarizationEnabled: boolean
-  speakerCount: number | null
-  speaker0Role: string
-  speaker1Role: string
-}) {
-  const controller = new AbortController()
-
-  const timeout = setTimeout(() => {
-    controller.abort()
-  }, REQUEST_TIMEOUT_MS)
+  const lastLine = lines.at(-1) || ''
 
   try {
-    const dataUri = await fileToDataUri(params.file)
-
-    const parameters: Record<string, unknown> = {
-      format: params.format
-    }
-
-    if (params.sampleRate.trim()) {
-      parameters.sample_rate = params.sampleRate.trim()
-    }
-
-    if (params.diarizationEnabled) {
-      parameters.diarization_enabled = true
-
-      if (params.speakerCount) {
-        parameters.speaker_count = params.speakerCount
-      }
-    }
-
-    const response = await fetch(params.apiUrl, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${params.apiKey}`,
-        'Content-Type': 'application/json',
-        'X-DashScope-SSE': 'disable'
-      },
-      body: JSON.stringify({
-        model: params.model,
-        input: {
-          messages: createMessages({
-            dataUri,
-            context: params.context
-          })
-        },
-        parameters
-      })
-    })
-
-    const rawText = await response.text()
-
-    let json: FunAsrResponse | null = null
-
-    try {
-      json = JSON.parse(rawText) as FunAsrResponse
-    } catch {
-      json = null
-    }
-
-    if (!response.ok) {
-      throw new AppApiError(
-        response.status,
-        json?.message ||
-          rawText ||
-          `Ошибка Fun-ASR: ${response.status} ${response.statusText}`
-      )
-    }
-
-    if (!json) {
-      throw new AppApiError(502, 'Fun-ASR вернул пустой ответ')
-    }
-
-    const text = extractTranscript({
-      json,
-      speaker0Role: params.speaker0Role,
-      speaker1Role: params.speaker1Role
-    })
-
-    return {
-      text,
-      usage: json.usage ?? null,
-      requestId: json.request_id ?? null,
-      raw: json
-    }
-  } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new AppApiError(408, 'Fun-ASR слишком долго обрабатывал аудио')
-    }
-
-    throw error
-  } finally {
-    clearTimeout(timeout)
+    return JSON.parse(lastLine) as PythonResult
+  } catch {
+    return null
   }
+}
+
+function runPythonTranscription(payload: Record<string, unknown>) {
+  return new Promise<PythonResult>((resolve, reject) => {
+    const child = spawn(getPythonCommand(), [getScriptPath()], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env
+      }
+    })
+
+    let stdout = ''
+    let stderr = ''
+
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL')
+      reject(new AppApiError(408, 'Fun-ASR слишком долго обрабатывал аудио'))
+    }, REQUEST_TIMEOUT_MS)
+
+    child.stdout.on('data', chunk => {
+      stdout += chunk.toString()
+    })
+
+    child.stderr.on('data', chunk => {
+      stderr += chunk.toString()
+    })
+
+    child.on('error', error => {
+      clearTimeout(timeout)
+      reject(error)
+    })
+
+    child.on('close', code => {
+      clearTimeout(timeout)
+
+      const result = parsePythonResult(stdout)
+
+      if (!result) {
+        reject(
+          new AppApiError(
+            500,
+            stderr || stdout || 'Python не вернул корректный JSON'
+          )
+        )
+        return
+      }
+
+      if (code !== 0 || !result.ok) {
+        reject(
+          new AppApiError(
+            500,
+            result.error || stderr || 'Fun-ASR не смог распознать аудио'
+          )
+        )
+        return
+      }
+
+      resolve(result)
+    })
+
+    child.stdin.write(JSON.stringify(payload))
+    child.stdin.end()
+  })
 }
 
 export async function POST(request: Request) {
+  let tempFilePath: string | null = null
+
   try {
     await requireAdmin(request)
 
@@ -389,15 +216,14 @@ export async function POST(request: Request) {
 
     const file = formData.get('file')
     const apiKey = String(formData.get('apiKey') || '').trim()
-    const apiUrl = normalizeApiUrl(String(formData.get('apiUrl') || ''))
-    const model = String(formData.get('model') || DEFAULT_MODEL).trim()
-    const sampleRate = String(formData.get('sampleRate') || '').trim()
-    const context = String(formData.get('context') || '').trim()
+    const apiUrl = normalizeBaseApiUrl(String(formData.get('apiUrl') || ''))
+    const model = String(formData.get('model') || 'fun-asr').trim()
+    const languageHint = String(formData.get('languageHint') || 'ru').trim()
 
-    const diarizationEnabled = toBoolean(formData.get('diarizationEnabled'))
-    const speakerCount = toPositiveNumber(
-      String(formData.get('speakerCount') || '')
-    )
+    const diarizationEnabled =
+      String(formData.get('diarizationEnabled') || '').toLowerCase() === 'true'
+
+    const speakerCount = String(formData.get('speakerCount') || '2').trim()
     const speaker0Role = String(
       formData.get('speaker0Role') || 'Менеджер'
     ).trim()
@@ -417,19 +243,14 @@ export async function POST(request: Request) {
 
     assertAudioFile(file)
 
-    const format = getAudioFormat(
-      file.name,
-      String(formData.get('format') || '')
-    )
+    tempFilePath = await saveTempAudioFile(file)
 
-    const result = await callFunAsr({
-      apiUrl,
+    const result = await runPythonTranscription({
       apiKey,
+      baseApiUrl: apiUrl,
+      filePath: tempFilePath,
       model,
-      file,
-      format,
-      sampleRate,
-      context,
+      languageHint,
       diarizationEnabled,
       speakerCount,
       speaker0Role,
@@ -440,12 +261,17 @@ export async function POST(request: Request) {
       fileName: file.name,
       sizeBytes: file.size,
       model,
-      format,
-      text: result.text,
-      usage: result.usage,
-      requestId: result.requestId
+      text: result.text || '',
+      requestId: result.requestId || null,
+      taskId: result.taskId || null
     })
   } catch (error) {
-    return handleApiError(error) 
+    return handleApiError(error)
+  } finally {
+    if (tempFilePath) {
+      await rm(tempFilePath, {
+        force: true
+      })
+    }
   }
 }
