@@ -131,7 +131,15 @@ const TEXT_ACCEPT =
 const AUDIO_ACCEPT =
   '.mp3,.wav,.m4a,.ogg,.aac,.flac,.webm,.mp4,audio/*,video/mp4'
 
-const TEXT_EXTENSIONS = new Set(['.txt', '.jsonl', '.xlsx', '.xls', '.csv'])
+const TEXT_EXTENSIONS = new Set([
+  '.txt',
+  '.jsonl',
+  '.xlsx',
+  '.xls',
+  '.csv',
+  '.pdf',
+  '.docx'
+])
 const AUDIO_EXTENSIONS = new Set([
   '.mp3',
   '.wav',
