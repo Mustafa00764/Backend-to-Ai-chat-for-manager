@@ -394,7 +394,7 @@ function getFileInputHint(sourceKind: UploadSourceKind) {
     return 'Можно выбрать сразу много MP3, WAV, M4A, OGG, AAC, FLAC, WEBM или MP4. Файлы будут загружаться на сервер, сервер расшифрует аудио в текст и добавит результат в базу знаний.'
   }
 
-  return 'Можно выбрать сразу много TXT, JSONL, XLSX, XLS или CSV файлов. Excel-таблицы будут превращены в текст и импортированы в базу знаний.'
+  return 'Можно выбрать сразу много TXT, PDF, DOCX, JSONL, XLSX, XLS или CSV файлов. Excel-таблицы будут превращены в текст и импортированы в базу знаний.'
 }
 
 function getImportButtonLabel(
@@ -598,7 +598,7 @@ export function KnowledgePageClient() {
   const acceptedExtensionsLabel = useMemo(() => {
     return sourceKind === 'audio'
       ? 'MP3, WAV, M4A, OGG, AAC, FLAC, WEBM, MP4'
-      : 'TXT, JSONL'
+      : 'TXT, JSONL, PDF, DOCX'
   }, [sourceKind])
 
   function handleSourceKindChange(value: string | null) {
@@ -701,7 +701,7 @@ export function KnowledgePageClient() {
       toast.error(
         sourceKind === 'audio'
           ? 'Выбери аудиофайлы'
-          : 'Выбери TXT, JSONL, Excel или CSV файлы'
+          : 'Выбери TXT, JSONL, Excel, PDF, DOCX или CSV файлы'
       )
       return
     }
