@@ -455,72 +455,91 @@ async function importTranscriptToKnowledge(params: {
   settings: SavedSettings
   onProgress?: (progress: number) => void
 }) {
-  return new Promise<KnowledgeImportResponse>((resolve, reject) => {
-    const txtFileName = createBaseTxtFileName(params.originalFile.name)
-    const txtFile = new File([params.text.trim()], txtFileName, {
-      type: 'text/plain;charset=utf-8',
-      lastModified: Date.now()
-    })
-    const formData = new FormData()
-    const xhr = new XMLHttpRequest()
+  const txtFileName = createBaseTxtFileName(params.originalFile.name)
+  const transcript = params.text.trim()
 
-    formData.append('file', txtFile)
-    formData.append(
-      'title',
-      createKnowledgeTitle(
-        params.originalFile.name,
-        params.settings.knowledgeTitlePrefix
-      )
-    )
-    formData.append('channel', params.settings.knowledgeChannel)
-    formData.append('sourceKind', 'text')
+  if (!transcript) {
+    throw new Error('Нельзя отправить пустую расшифровку')
+  }
 
-    xhr.open('POST', '/api/admin-api/knowledge/import')
-
-    xhr.upload.onprogress = event => {
-      if (!event.lengthComputable) return
-
-      const progress = Math.round((event.loaded / event.total) * 100)
-
-      params.onProgress?.(Math.min(progress, 95))
-    }
-
-    xhr.onload = () => {
-      let json: unknown = null
-
-      try {
-        json = JSON.parse(xhr.responseText)
-      } catch {
-        json = null
-      }
-
-      if (xhr.status >= 200 && xhr.status < 300) {
-        params.onProgress?.(100)
-        resolve(json as KnowledgeImportResponse)
-        return
-      }
-
-      const message =
-        json &&
-        typeof json === 'object' &&
-        'error' in json &&
-        typeof json.error === 'string'
-          ? json.error
-          : xhr.responseText || 'Не удалось импортировать TXT в базу знаний'
-
-      reject(new Error(message))
-    }
-
-    xhr.onerror = () => {
-      reject(new Error('Ошибка сети при импорте TXT в базу знаний'))
-    }
-
-    xhr.onabort = () => {
-      reject(new Error('Импорт TXT в базу знаний был отменён'))
-    }
-
-    xhr.send(formData)
+  /**
+   * Важно: используем строго text/plain без charset в MIME.
+   * Некоторые backend-проверки отклоняют text/plain;charset=utf-8,
+   * хотя содержимое файла при этом корректное.
+   */
+  const txtFile = new File([transcript], txtFileName, {
+    type: 'text/plain',
+    lastModified: Date.now()
   })
+  const formData = new FormData()
+
+  formData.append('file', txtFile, txtFileName)
+  formData.append(
+    'title',
+    createKnowledgeTitle(
+      params.originalFile.name,
+      params.settings.knowledgeTitlePrefix
+    )
+  )
+  formData.append('channel', params.settings.knowledgeChannel || 'PHONE')
+  formData.append('sourceKind', 'text')
+
+  params.onProgress?.(10)
+
+  const response = await fetch('/api/admin-api/knowledge/import', {
+    method: 'POST',
+    body: formData,
+    credentials: 'same-origin',
+    headers: {
+      Accept: 'application/json'
+    }
+  })
+
+  params.onProgress?.(90)
+
+  const responseText = await response.text()
+  let json: unknown = null
+
+  if (responseText) {
+    try {
+      json = JSON.parse(responseText)
+    } catch {
+      json = null
+    }
+  }
+
+  if (!response.ok) {
+    const backendMessage =
+      json &&
+      typeof json === 'object' &&
+      'error' in json &&
+      typeof json.error === 'string'
+        ? json.error
+        : responseText
+
+    throw new Error(
+      backendMessage ||
+        `Backend вернул ошибку ${response.status} ${response.statusText}`
+    )
+  }
+
+  if (!json || typeof json !== 'object') {
+    throw new Error(
+      'Backend принял запрос, но вернул некорректный ответ вместо JSON'
+    )
+  }
+
+  const data = json as KnowledgeImportResponse
+
+  if (!data.source?.id) {
+    throw new Error(
+      'Backend не вернул source.id — источник не подтверждён как сохранённый'
+    )
+  }
+
+  params.onProgress?.(100)
+
+  return data
 }
 
 async function runWithConcurrency<T, R>(params: {
@@ -557,6 +576,37 @@ async function runWithConcurrency<T, R>(params: {
   await Promise.all(workers)
 
   return results
+}
+
+function createConcurrencyLimiter(maxConcurrent: number) {
+  const limit = Math.max(1, maxConcurrent)
+  let activeCount = 0
+  const queue: Array<() => void> = []
+
+  function release() {
+    activeCount -= 1
+    const next = queue.shift()
+
+    if (next) {
+      next()
+    }
+  }
+
+  return async function limitRun<T>(task: () => Promise<T>) {
+    if (activeCount >= limit) {
+      await new Promise<void>(resolve => {
+        queue.push(resolve)
+      })
+    }
+
+    activeCount += 1
+
+    try {
+      return await task()
+    } finally {
+      release()
+    }
+  }
 }
 
 async function transcribeFile(params: { file: File; settings: SavedSettings }) {
@@ -1042,11 +1092,11 @@ export function AudioTranscriberPageClient() {
       item: TranscribeItem
       text?: string
       error?: string
+      knowledgeStatus?: 'success' | 'error'
+      knowledgeError?: string
     }> = []
 
-    let knowledgeImportedCount = 0
-    let knowledgeFailedCount = 0
-
+    const limitKnowledgeImport = createConcurrencyLimiter(4)
     const batches = chunkArray(itemsToProcess, TRANSCRIBE_BATCH_SIZE)
 
     for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
@@ -1104,10 +1154,27 @@ export function AudioTranscriberPageClient() {
               taskId: result.taskId ?? null
             }))
 
+            /**
+             * Не ждём завершения всей пачки. Как только конкретная
+             * расшифровка готова, сразу ставим её в очередь импорта.
+             */
+            const knowledgeResult = await limitKnowledgeImport(() =>
+              sendTranscriptToKnowledge({
+                itemId: item.id,
+                file: item.file,
+                text: transcriptText
+              })
+            )
+
             return {
               status: 'success' as const,
               item,
-              text: transcriptText
+              text: transcriptText,
+              knowledgeStatus: knowledgeResult.status,
+              knowledgeError:
+                knowledgeResult.status === 'error'
+                  ? knowledgeResult.error
+                  : undefined
             }
           } catch (error) {
             const message =
@@ -1133,39 +1200,6 @@ export function AudioTranscriberPageClient() {
 
       results.push(...batchResults)
 
-      const readyForKnowledge = batchResults.flatMap(result => {
-        if (result.status !== 'success' || !result.text?.trim()) {
-          return []
-        }
-
-        return [
-          {
-            item: result.item,
-            text: result.text
-          }
-        ]
-      })
-
-      if (readyForKnowledge.length > 0) {
-        const knowledgeResults = await runWithConcurrency({
-          items: readyForKnowledge,
-          concurrency: 4,
-          worker: result =>
-            sendTranscriptToKnowledge({
-              itemId: result.item.id,
-              file: result.item.file,
-              text: result.text
-            })
-        })
-
-        knowledgeImportedCount += knowledgeResults.filter(
-          result => result.status === 'success'
-        ).length
-        knowledgeFailedCount += knowledgeResults.filter(
-          result => result.status === 'error'
-        ).length
-      }
-
       const hasNextBatch = batchIndex < batches.length - 1
 
       if (hasNextBatch) {
@@ -1181,6 +1215,12 @@ export function AudioTranscriberPageClient() {
 
     const done = results.filter(result => result.status === 'success').length
     const failed = results.filter(result => result.status === 'error').length
+    const knowledgeImportedCount = results.filter(
+      result => result.knowledgeStatus === 'success'
+    ).length
+    const knowledgeFailedCount = results.filter(
+      result => result.knowledgeStatus === 'error'
+    ).length
 
     if (done > 0 && failed === 0 && knowledgeFailedCount === 0) {
       toast.success('Все аудио обработаны и добавлены в базу знаний', {
@@ -1189,8 +1229,14 @@ export function AudioTranscriberPageClient() {
     }
 
     if (failed > 0 || knowledgeFailedCount > 0) {
+      const firstImportError = results.find(
+        result => result.knowledgeStatus === 'error'
+      )?.knowledgeError
+
       toast.error('Обработка завершена с ошибками', {
-        description: `TXT готово: ${done}, ошибок распознавания: ${failed}, импортировано: ${knowledgeImportedCount}, ошибок импорта: ${knowledgeFailedCount}`
+        description: firstImportError
+          ? `TXT готово: ${done}, импортировано: ${knowledgeImportedCount}. Первая ошибка импорта: ${firstImportError}`
+          : `TXT готово: ${done}, ошибок распознавания: ${failed}, импортировано: ${knowledgeImportedCount}, ошибок импорта: ${knowledgeFailedCount}`
       })
     }
   }
