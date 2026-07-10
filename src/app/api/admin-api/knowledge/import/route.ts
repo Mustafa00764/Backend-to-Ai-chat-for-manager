@@ -6,12 +6,25 @@ import * as XLSX from 'xlsx'
 import { AppApiError, handleApiError } from '@/lib/api/api-error'
 import { requireAdmin } from '@/lib/auth/current-user'
 import { importKnowledgeFile } from '@/server/knowledge/knowledge-import-service'
+import { deleteObjectFromS3, downloadS3FileToBuffer, getS3ObjectMetadata } from '@/lib/storage/s3-client'
+
 
 export const runtime = 'nodejs'
 
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
 const SPREADSHEET_EXTENSIONS = new Set(['.xlsx', '.xls', '.csv'])
+
 const PDF_EXTENSIONS = new Set(['.pdf'])
 const DOCX_EXTENSIONS = new Set(['.docx'])
+
+const ALLOWED_EXTENSIONS = new Set([
+  '.txt',
+  '.jsonl',
+  ...SPREADSHEET_EXTENSIONS,
+  ...PDF_EXTENSIONS,
+  ...DOCX_EXTENSIONS
+])
 
 const SPREADSHEET_MIME_TYPES = new Set([
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -25,6 +38,32 @@ const PDF_MIME_TYPES = new Set(['application/pdf'])
 const DOCX_MIME_TYPES = new Set([
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 ])
+
+const MIME_BY_EXTENSION: Record<string, string> = {
+  '.txt': 'text/plain',
+  '.jsonl': 'application/jsonl',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.xls': 'application/vnd.ms-excel',
+  '.csv': 'text/csv',
+  '.pdf': 'application/pdf',
+  '.docx':
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+}
+
+type DirectImportRequest = {
+  s3Key?: unknown
+  fileName?: unknown
+  contentType?: unknown
+  title?: unknown
+  channel?: unknown
+}
+
+type ImportPayload = {
+  file: File
+  title: string
+  channel: string
+  temporaryS3Key: string | null
+}
 
 function getFileExtension(fileName: string) {
   const dotIndex = fileName.lastIndexOf('.')
@@ -41,7 +80,7 @@ function hasSupportedExtension(file: File, extensions: ReadonlySet<string>) {
 }
 
 function hasSupportedMimeType(file: File, mimeTypes: ReadonlySet<string>) {
-  return mimeTypes.has(file.type.toLowerCase())
+  return mimeTypes.has(file.type.split(';')[0].trim().toLowerCase())
 }
 
 function isSpreadsheetFile(file: File) {
@@ -269,8 +308,6 @@ async function convertDocxToTextFile(file: File) {
       .map(message => message.message)
       .filter(Boolean)
 
-    const textParts = [`# Документ: ${file.name}`, result.value]
-
     if (warnings.length > 0) {
       console.warn('DOCX IMPORT WARNINGS:', {
         fileName: file.name,
@@ -280,7 +317,7 @@ async function convertDocxToTextFile(file: File) {
 
     return createTextFile(
       file,
-      textParts.join('\n\n'),
+      [`# Документ: ${file.name}`, result.value].join('\n\n'),
       'DOCX файл пустой или не содержит доступного текста'
     )
   } catch (error) {
@@ -311,6 +348,146 @@ async function convertSupportedFileToTextFile(file: File) {
   return file
 }
 
+function resolveContentType(
+  fileName: string,
+  requestedContentType: string,
+  storedContentType: string
+) {
+  const normalizedStored = storedContentType.split(';')[0].trim().toLowerCase()
+
+  if (normalizedStored) {
+    return normalizedStored
+  }
+
+  const normalizedRequested = requestedContentType
+    .split(';')[0]
+    .trim()
+    .toLowerCase()
+
+  if (normalizedRequested) {
+    return normalizedRequested
+  }
+
+  return (
+    MIME_BY_EXTENSION[getFileExtension(fileName)] || 'application/octet-stream'
+  )
+}
+
+function validateFileName(fileName: string) {
+  const extension = getFileExtension(fileName)
+
+  if (!ALLOWED_EXTENSIONS.has(extension)) {
+    throw new AppApiError(
+      400,
+      'Разрешены TXT, JSONL, XLSX, XLS, CSV, PDF и DOCX'
+    )
+  }
+}
+
+async function readDirectImportPayload(
+  request: Request,
+  actorId: string
+): Promise<ImportPayload> {
+  const body = (await request.json()) as DirectImportRequest
+
+  const s3Key = typeof body.s3Key === 'string' ? body.s3Key.trim() : ''
+
+  const fileName = typeof body.fileName === 'string' ? body.fileName.trim() : ''
+
+  const requestedContentType =
+    typeof body.contentType === 'string' ? body.contentType : ''
+
+  const title = typeof body.title === 'string' ? body.title.trim() : ''
+
+  const channel =
+    typeof body.channel === 'string' ? body.channel.trim() : 'OTHER'
+
+  if (!s3Key) {
+    throw new AppApiError(400, 's3Key не передан')
+  }
+
+  const expectedPrefix = `knowledge/temp/${actorId}/`
+
+  if (!s3Key.startsWith(expectedPrefix)) {
+    throw new AppApiError(403, 'Недопустимый ключ временного файла')
+  }
+
+  if (!fileName) {
+    throw new AppApiError(400, 'Имя файла не передано')
+  }
+
+  validateFileName(fileName)
+
+  const metadata = await getS3ObjectMetadata({
+    key: s3Key
+  })
+
+  if (
+    metadata.contentLength <= 0 ||
+    metadata.contentLength > MAX_UPLOAD_BYTES
+  ) {
+    throw new AppApiError(
+      413,
+      `Максимальный размер документа: ${MAX_UPLOAD_BYTES / 1024 / 1024} МБ`
+    )
+  }
+
+  const contentType = resolveContentType(
+    fileName,
+    requestedContentType,
+    metadata.contentType
+  )
+
+  const buffer = await downloadS3FileToBuffer({
+    key: s3Key
+  })
+
+  if (buffer.length === 0) {
+    throw new AppApiError(400, 'Загруженный файл пустой')
+  }
+
+  return {
+    file: new File([buffer], fileName, {
+      type: contentType
+    }),
+    title: title || fileName,
+    channel: channel || 'OTHER',
+    temporaryS3Key: s3Key
+  }
+}
+
+async function readLegacyMultipartPayload(
+  request: Request
+): Promise<ImportPayload> {
+  const formData = await request.formData()
+  const file = formData.get('file')
+  const title = String(formData.get('title') || '')
+  const channel = String(formData.get('channel') || 'OTHER')
+
+  if (!(file instanceof File)) {
+    throw new AppApiError(400, 'Файл не передан')
+  }
+
+  validateFileName(file.name)
+
+  return {
+    file,
+    title: title || file.name,
+    channel,
+    temporaryS3Key: null
+  }
+}
+
+async function readImportPayload(request: Request, actorId: string) {
+  const contentType = request.headers.get('content-type') || ''
+
+  if (contentType.toLowerCase().includes('application/json')) {
+    return readDirectImportPayload(request, actorId)
+  }
+
+  return readLegacyMultipartPayload(request)
+}
+
 function serializeSource(
   result: Awaited<ReturnType<typeof importKnowledgeFile>>
 ) {
@@ -328,25 +505,22 @@ function serializeSource(
 }
 
 export async function POST(request: Request) {
+  let temporaryS3Key: string | null = null
+
   try {
     const currentUser = await requireAdmin(request)
-    const formData = await request.formData()
 
-    const file = formData.get('file')
-    const title = String(formData.get('title') || '')
-    const channel = String(formData.get('channel') || 'OTHER')
+    const payload = await readImportPayload(request, currentUser.id)
 
-    if (!(file instanceof File)) {
-      throw new AppApiError(400, 'Файл не передан')
-    }
+    temporaryS3Key = payload.temporaryS3Key
 
-    const fileForImport = await convertSupportedFileToTextFile(file)
+    const fileForImport = await convertSupportedFileToTextFile(payload.file)
 
     const result = await importKnowledgeFile({
       actorId: currentUser.id,
       file: fileForImport,
-      title: title || file.name,
-      channel
+      title: payload.title,
+      channel: payload.channel
     })
 
     return NextResponse.json(serializeSource(result), {
@@ -354,5 +528,14 @@ export async function POST(request: Request) {
     })
   } catch (error) {
     return handleApiError(error)
+  } finally {
+    if (temporaryS3Key) {
+      await deleteObjectFromS3(temporaryS3Key).catch(error => {
+        console.error('Не удалось удалить временный файл из S3:', {
+          key: temporaryS3Key,
+          error
+        })
+      })
+    }
   }
 }

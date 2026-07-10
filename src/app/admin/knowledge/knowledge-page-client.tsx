@@ -116,6 +116,14 @@ type ImportKnowledgeFileOptions = {
   onProgress: (progress: number) => void
 }
 
+type DirectUploadUrlResponse = {
+  uploadUrl: string
+  key: string
+  contentType: string
+  expiresInSeconds: number
+  maxSizeBytes: number
+}
+
 type EmbeddingProgress = {
   total: number
   embedded: number
@@ -233,7 +241,162 @@ function getImportEndpoint(sourceKind: UploadSourceKind) {
   return '/api/admin-api/knowledge/import'
 }
 
-async function importKnowledgeFile({
+function getDocumentContentType(file: File) {
+  if (file.type.trim()) {
+    return file.type.split(';')[0].trim().toLowerCase()
+  }
+
+  const extension = getFileExtension(file)
+
+  const mimeByExtension: Record<string, string> = {
+    '.txt': 'text/plain',
+    '.jsonl': 'application/jsonl',
+    '.xlsx':
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.xls': 'application/vnd.ms-excel',
+    '.csv': 'text/csv',
+    '.pdf': 'application/pdf',
+    '.docx':
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  }
+
+  return mimeByExtension[extension] || 'application/octet-stream'
+}
+
+async function createDirectUploadUrl(file: File) {
+  const response = await fetch('/api/admin-api/knowledge/upload-url', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      fileName: file.name,
+      contentType: getDocumentContentType(file),
+      sizeBytes: file.size
+    })
+  })
+
+  const json = await response.json().catch(() => null)
+
+  if (!response.ok) {
+    const message =
+      json &&
+      typeof json === 'object' &&
+      'error' in json &&
+      typeof json.error === 'string'
+        ? json.error
+        : 'Не удалось подготовить прямую загрузку'
+
+    throw new Error(message)
+  }
+
+  return json as DirectUploadUrlResponse
+}
+
+function uploadFileToSignedUrl({
+  file,
+  uploadUrl,
+  contentType,
+  onProgress
+}: {
+  file: File
+  uploadUrl: string
+  contentType: string
+  onProgress: (progress: number) => void
+}) {
+  return new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+
+    xhr.open('PUT', uploadUrl)
+    xhr.setRequestHeader('Content-Type', contentType)
+
+    xhr.upload.onprogress = event => {
+      if (!event.lengthComputable) {
+        return
+      }
+
+      const percentage = Math.round((event.loaded / event.total) * 90)
+
+      onProgress(Math.min(percentage, 90))
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        onProgress(90)
+        resolve()
+        return
+      }
+
+      reject(new Error(xhr.responseText || `S3 вернул код ${xhr.status}`))
+    }
+
+    xhr.onerror = () => {
+      reject(
+        new Error(
+          'Не удалось загрузить файл напрямую в S3. Проверьте CORS bucket'
+        )
+      )
+    }
+
+    xhr.onabort = () => {
+      reject(new Error('Загрузка файла отменена'))
+    }
+
+    xhr.send(file)
+  })
+}
+
+async function importDocumentThroughS3({
+  file,
+  title,
+  channel,
+  onProgress
+}: Omit<ImportKnowledgeFileOptions, 'sourceKind'>) {
+  const directUpload = await createDirectUploadUrl(file)
+
+  await uploadFileToSignedUrl({
+    file,
+    uploadUrl: directUpload.uploadUrl,
+    contentType: directUpload.contentType,
+    onProgress
+  })
+
+  onProgress(95)
+
+  const response = await fetch('/api/admin-api/knowledge/import', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      s3Key: directUpload.key,
+      fileName: file.name,
+      contentType: directUpload.contentType,
+      title: title || file.name,
+      channel
+    })
+  })
+
+  const json = await response.json().catch(() => null)
+
+  if (!response.ok) {
+    const message =
+      json &&
+      typeof json === 'object' &&
+      'error' in json &&
+      typeof json.error === 'string'
+        ? json.error
+        : 'Не удалось импортировать документ'
+
+    throw new Error(message)
+  }
+
+  onProgress(100)
+
+  return json as ImportResponse
+}
+
+async function importLegacyMultipartFile({
   file,
   title,
   channel,
@@ -252,14 +415,12 @@ async function importKnowledgeFile({
     xhr.open('POST', getImportEndpoint(sourceKind))
 
     xhr.upload.onprogress = event => {
-      if (!event.lengthComputable) return
+      if (!event.lengthComputable) {
+        return
+      }
 
       const progress = Math.round((event.loaded / event.total) * 100)
 
-      /**
-       * 95%, потому что после загрузки файла backend ещё импортирует текст
-       * или расшифровывает аудио, режет на chunks и сохраняет в базу.
-       */
       onProgress(Math.min(progress, 95))
     }
 
@@ -299,6 +460,19 @@ async function importKnowledgeFile({
 
     xhr.send(formData)
   })
+}
+
+async function importKnowledgeFile(options: ImportKnowledgeFileOptions) {
+  if (options.sourceKind === 'text') {
+    return importDocumentThroughS3({
+      file: options.file,
+      title: options.title,
+      channel: options.channel,
+      onProgress: options.onProgress
+    })
+  }
+
+  return importLegacyMultipartFile(options)
 }
 
 async function fetchEmbeddingStats() {
