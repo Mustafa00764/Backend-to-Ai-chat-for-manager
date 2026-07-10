@@ -116,6 +116,15 @@ type ImportKnowledgeFileOptions = {
   onProgress: (progress: number) => void
 }
 
+type EmbeddingProgress = {
+  total: number
+  embedded: number
+  notEmbedded: number
+  processedThisRun: number
+  percentage: number
+  currentBatch: number
+}
+
 const TEXT_ACCEPT =
   '.txt,.jsonl,.xlsx,.xls,.csv,text/plain,application/json,application/jsonl,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv'
 
@@ -133,6 +142,14 @@ const AUDIO_EXTENSIONS = new Set([
   '.webm',
   '.mp4'
 ])
+
+const EMBEDDING_BATCH_SIZE = 50
+const EMBEDDING_BATCH_DELAY_MS = 500
+const MAX_EMBEDDING_BATCHES = 10_000
+
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
 
 async function fetchSources() {
   const response = await fetch('/api/admin-api/knowledge/sources')
@@ -256,15 +273,31 @@ async function fetchEmbeddingStats() {
   return response.json() as Promise<EmbeddingStatsResponse>
 }
 
-async function runEmbeddings() {
-  const response = await fetch('/api/admin-api/knowledge/embeddings?limit=10', {
-    method: 'POST'
+async function runEmbeddingsBatch(limit: number, signal?: AbortSignal) {
+  const params = new URLSearchParams({
+    limit: String(limit)
   })
 
-  const json = await response.json()
+  const response = await fetch(
+    `/api/admin-api/knowledge/embeddings?${params}`,
+    {
+      method: 'POST',
+      signal
+    }
+  )
+
+  const json = await response.json().catch(() => null)
 
   if (!response.ok) {
-    throw new Error(json.error || 'Не удалось создать embeddings')
+    const message =
+      json &&
+      typeof json === 'object' &&
+      'error' in json &&
+      typeof json.error === 'string'
+        ? json.error
+        : 'Не удалось создать embeddings'
+
+    throw new Error(message)
   }
 
   return json as EmbeddingRunResponse
@@ -375,6 +408,7 @@ function getImportButtonLabel(
 export function KnowledgePageClient() {
   const queryClient = useQueryClient()
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const embeddingsAbortControllerRef = useRef<AbortController | null>(null)
 
   const [title, setTitle] = useState('')
   const [channel, setChannel] = useState('PHONE')
@@ -385,6 +419,9 @@ export function KnowledgePageClient() {
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResult, setSearchResult] =
     useState<KnowledgeSearchResponse | null>(null)
+
+  const [embeddingProgress, setEmbeddingProgress] =
+    useState<EmbeddingProgress | null>(null)
 
   const sourcesQuery = useQuery({
     queryKey: ['knowledge-sources'],
@@ -397,7 +434,107 @@ export function KnowledgePageClient() {
   })
 
   const embeddingsMutation = useMutation({
-    mutationFn: runEmbeddings,
+    mutationFn: async () => {
+      const controller = new AbortController()
+      embeddingsAbortControllerRef.current = controller
+
+      const initialStats = await fetchEmbeddingStats()
+      const initialEmbedded = initialStats.stats.embedded
+      const total = initialStats.stats.total
+
+      let processedThisRun = 0
+      let batchNumber = 0
+      let latestStats = initialStats.stats
+
+      setEmbeddingProgress({
+        total,
+        embedded: initialStats.stats.embedded,
+        notEmbedded: initialStats.stats.notEmbedded,
+        processedThisRun: 0,
+        percentage:
+          total > 0
+            ? Math.round((initialStats.stats.embedded / total) * 100)
+            : 100,
+        currentBatch: 0
+      })
+
+      if (initialStats.stats.notEmbedded === 0) {
+        return {
+          processedThisRun: 0,
+          stats: initialStats.stats
+        }
+      }
+
+      while (
+        latestStats.notEmbedded > 0 &&
+        batchNumber < MAX_EMBEDDING_BATCHES
+      ) {
+        if (controller.signal.aborted) {
+          throw new DOMException(
+            'Создание embeddings остановлено',
+            'AbortError'
+          )
+        }
+
+        batchNumber += 1
+
+        const batchResult = await runEmbeddingsBatch(
+          EMBEDDING_BATCH_SIZE,
+          controller.signal
+        )
+
+        const processed = Math.max(0, Number(batchResult.result.processed || 0))
+
+        processedThisRun += processed
+        latestStats = batchResult.stats
+
+        const embeddedSinceStart = Math.max(
+          0,
+          latestStats.embedded - initialEmbedded
+        )
+
+        setEmbeddingProgress({
+          total: latestStats.total,
+          embedded: latestStats.embedded,
+          notEmbedded: latestStats.notEmbedded,
+          processedThisRun: Math.max(processedThisRun, embeddedSinceStart),
+          percentage:
+            latestStats.total > 0
+              ? Math.min(
+                  100,
+                  Math.round((latestStats.embedded / latestStats.total) * 100)
+                )
+              : 100,
+          currentBatch: batchNumber
+        })
+
+        queryClient.setQueryData<EmbeddingStatsResponse>(
+          ['knowledge-embedding-stats'],
+          {
+            stats: latestStats
+          }
+        )
+
+        if (processed === 0) {
+          break
+        }
+
+        if (latestStats.notEmbedded > 0) {
+          await sleep(EMBEDDING_BATCH_DELAY_MS)
+        }
+      }
+
+      if (batchNumber >= MAX_EMBEDDING_BATCHES) {
+        throw new Error(
+          'Достигнут защитный лимит количества пакетов embeddings'
+        )
+      }
+
+      return {
+        processedThisRun,
+        stats: latestStats
+      }
+    },
     onSuccess: data => {
       queryClient.invalidateQueries({
         queryKey: ['knowledge-embedding-stats']
@@ -407,12 +544,32 @@ export function KnowledgePageClient() {
         queryKey: ['knowledge-sources']
       })
 
-      toast.success('Embeddings созданы', {
-        description: `Обработано chunks: ${data.result.processed}`
+      if (data.stats.notEmbedded === 0) {
+        toast.success('Все embeddings созданы', {
+          description: `Обработано chunks за этот запуск: ${data.processedThisRun}`
+        })
+        return
+      }
+
+      toast.warning('Создание embeddings остановлено', {
+        description:
+          `Обработано: ${data.processedThisRun}. ` +
+          `Осталось без embedding: ${data.stats.notEmbedded}. ` +
+          'Backend вернул processed: 0.'
       })
     },
     onError: error => {
-      toast.error(error.message)
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        toast.info('Создание embeddings остановлено')
+        return
+      }
+
+      toast.error(
+        error instanceof Error ? error.message : 'Не удалось создать embeddings'
+      )
+    },
+    onSettled: () => {
+      embeddingsAbortControllerRef.current = null
     }
   })
 
@@ -425,6 +582,10 @@ export function KnowledgePageClient() {
       toast.error(error.message)
     }
   })
+
+  function handleStopEmbeddings() {
+    embeddingsAbortControllerRef.current?.abort()
+  }
 
   const acceptedExtensionsLabel = useMemo(() => {
     return sourceKind === 'audio'
@@ -916,25 +1077,69 @@ export function KnowledgePageClient() {
             </p>
           ) : null}
 
-          <div className="flex flex-wrap gap-2">
-            <Button
-              onClick={() => embeddingsMutation.mutate()}
-              disabled={embeddingsMutation.isPending}
-            >
-              {embeddingsMutation.isPending
-                ? 'Создаю embeddings...'
-                : 'Создать embeddings для 10 chunks'}
-            </Button>
+          <div className="space-y-3">
+            <div className="flex flex-wrap gap-2">
+              <Button
+                onClick={() => embeddingsMutation.mutate()}
+                disabled={
+                  embeddingsMutation.isPending ||
+                  (embeddingStatsQuery.data?.stats.notEmbedded ?? 0) === 0
+                }
+              >
+                {embeddingsMutation.isPending
+                  ? `Создаю embeddings: ${embeddingProgress?.percentage ?? 0}%`
+                  : 'Создать embeddings для всех'}
+              </Button>
 
-            <Button
-              variant="outline"
-              onClick={() => embeddingStatsQuery.refetch()}
-              disabled={embeddingStatsQuery.isFetching}
-            >
-              {embeddingStatsQuery.isFetching
-                ? 'Обновляю...'
-                : 'Обновить статистику'}
-            </Button>
+              {embeddingsMutation.isPending ? (
+                <Button variant="destructive" onClick={handleStopEmbeddings}>
+                  Остановить
+                </Button>
+              ) : null}
+
+              <Button
+                variant="outline"
+                onClick={() => embeddingStatsQuery.refetch()}
+                disabled={
+                  embeddingStatsQuery.isFetching || embeddingsMutation.isPending
+                }
+              >
+                {embeddingStatsQuery.isFetching
+                  ? 'Обновляю...'
+                  : 'Обновить статистику'}
+              </Button>
+            </div>
+
+            {embeddingProgress ? (
+              <div className="space-y-2 rounded-lg border p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-sm font-medium">Прогресс embeddings</p>
+                  <p className="text-sm text-muted-foreground">
+                    {embeddingProgress.embedded} / {embeddingProgress.total}
+                    {' · '}
+                    {embeddingProgress.percentage}%
+                  </p>
+                </div>
+
+                <div className="h-2 overflow-hidden rounded-full bg-muted">
+                  <div
+                    className="h-full bg-primary transition-all duration-300"
+                    style={{
+                      width: `${embeddingProgress.percentage}%`
+                    }}
+                  />
+                </div>
+
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                  <span>
+                    Обработано за запуск: {embeddingProgress.processedThisRun}
+                  </span>
+                  <span>Осталось: {embeddingProgress.notEmbedded}</span>
+                  <span>Пакет: {embeddingProgress.currentBatch}</span>
+                  <span>Размер пакета: {EMBEDDING_BATCH_SIZE}</span>
+                </div>
+              </div>
+            ) : null}
           </div>
 
           <div className="space-y-2">
