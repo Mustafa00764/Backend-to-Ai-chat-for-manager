@@ -1,4 +1,6 @@
 import { NextResponse } from 'next/server'
+import * as mammoth from 'mammoth'
+import { extractText, getDocumentProxy } from 'unpdf'
 import * as XLSX from 'xlsx'
 
 import { AppApiError, handleApiError } from '@/lib/api/api-error'
@@ -7,13 +9,21 @@ import { importKnowledgeFile } from '@/server/knowledge/knowledge-import-service
 
 export const runtime = 'nodejs'
 
-const SPREADSHEET_EXTENSIONS = new Set(['.xlsx', '.xls', '.csv', '.pdf', '.docx'])
+const SPREADSHEET_EXTENSIONS = new Set(['.xlsx', '.xls', '.csv'])
+const PDF_EXTENSIONS = new Set(['.pdf'])
+const DOCX_EXTENSIONS = new Set(['.docx'])
 
 const SPREADSHEET_MIME_TYPES = new Set([
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   'application/vnd.ms-excel',
   'text/csv',
   'application/csv'
+])
+
+const PDF_MIME_TYPES = new Set(['application/pdf'])
+
+const DOCX_MIME_TYPES = new Set([
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 ])
 
 function getFileExtension(fileName: string) {
@@ -26,14 +36,33 @@ function getFileExtension(fileName: string) {
   return fileName.slice(dotIndex).toLowerCase()
 }
 
+function hasSupportedExtension(file: File, extensions: ReadonlySet<string>) {
+  return extensions.has(getFileExtension(file.name))
+}
+
+function hasSupportedMimeType(file: File, mimeTypes: ReadonlySet<string>) {
+  return mimeTypes.has(file.type.toLowerCase())
+}
+
 function isSpreadsheetFile(file: File) {
-  const extension = getFileExtension(file.name)
+  return (
+    hasSupportedExtension(file, SPREADSHEET_EXTENSIONS) ||
+    hasSupportedMimeType(file, SPREADSHEET_MIME_TYPES)
+  )
+}
 
-  if (SPREADSHEET_EXTENSIONS.has(extension)) {
-    return true
-  }
+function isPdfFile(file: File) {
+  return (
+    hasSupportedExtension(file, PDF_EXTENSIONS) ||
+    hasSupportedMimeType(file, PDF_MIME_TYPES)
+  )
+}
 
-  return SPREADSHEET_MIME_TYPES.has(file.type)
+function isDocxFile(file: File) {
+  return (
+    hasSupportedExtension(file, DOCX_EXTENSIONS) ||
+    hasSupportedMimeType(file, DOCX_MIME_TYPES)
+  )
 }
 
 function cleanCellValue(value: unknown) {
@@ -42,6 +71,42 @@ function cleanCellValue(value: unknown) {
   }
 
   return String(value).replace(/\s+/g, ' ').trim()
+}
+
+function normalizeExtractedText(value: string) {
+  return value
+    .replace(/\u0000/g, '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+function createTextFileName(fileName: string) {
+  const extension = getFileExtension(fileName)
+
+  if (!extension) {
+    return `${fileName}.txt`
+  }
+
+  return `${fileName.slice(0, -extension.length)}.txt`
+}
+
+function createTextFile(
+  sourceFile: File,
+  rawText: string,
+  emptyFileMessage: string
+) {
+  const text = normalizeExtractedText(rawText)
+
+  if (!text) {
+    throw new AppApiError(400, emptyFileMessage)
+  }
+
+  return new File([text], createTextFileName(sourceFile.name), {
+    type: 'text/plain'
+  })
 }
 
 function createRowText(headers: string[], row: unknown[], rowIndex: number) {
@@ -58,7 +123,9 @@ function createRowText(headers: string[], row: unknown[], rowIndex: number) {
 
   const pairs = values
     .map((value, index) => {
-      if (!value) return ''
+      if (!value) {
+        return ''
+      }
 
       const header = headers[index]?.trim()
 
@@ -78,14 +145,23 @@ function createRowText(headers: string[], row: unknown[], rowIndex: number) {
 }
 
 async function convertSpreadsheetToTextFile(file: File) {
-  const arrayBuffer = await file.arrayBuffer()
+  let workbook: XLSX.WorkBook
 
-  const workbook = XLSX.read(arrayBuffer, {
-    type: 'array',
-    cellDates: true,
-    cellText: false,
-    cellNF: false
-  })
+  try {
+    const arrayBuffer = await file.arrayBuffer()
+
+    workbook = XLSX.read(arrayBuffer, {
+      type: 'array',
+      cellDates: true,
+      cellText: false,
+      cellNF: false
+    })
+  } catch {
+    throw new AppApiError(
+      400,
+      'Не удалось прочитать Excel/CSV файл. Проверьте формат и целостность файла'
+    )
+  }
 
   const textParts: string[] = []
 
@@ -111,32 +187,128 @@ async function convertSpreadsheetToTextFile(file: File) {
 
     textParts.push(`# Лист: ${sheetName}`)
 
-    for (let index = 1; index < rows.length; index += 1) {
-      const rowText = createRowText(headers, rows[index], index + 1)
+    if (rows.length === 1) {
+      const firstRowText = createRowText([], rows[0], 1)
 
-      if (rowText) {
-        textParts.push(rowText)
+      if (firstRowText) {
+        textParts.push(firstRowText)
+      }
+    } else {
+      for (let index = 1; index < rows.length; index += 1) {
+        const rowText = createRowText(headers, rows[index], index + 1)
+
+        if (rowText) {
+          textParts.push(rowText)
+        }
       }
     }
 
     textParts.push('')
   }
 
-  const text = textParts.join('\n').trim()
+  return createTextFile(
+    file,
+    textParts.join('\n'),
+    'Excel/CSV файл пустой или не содержит текста'
+  )
+}
 
-  if (!text) {
-    throw new AppApiError(400, 'Excel/CSV файл пустой или не содержит текста')
+async function convertPdfToTextFile(file: File) {
+  let pdf: Awaited<ReturnType<typeof getDocumentProxy>> | null = null
+
+  try {
+    const arrayBuffer = await file.arrayBuffer()
+
+    pdf = await getDocumentProxy(new Uint8Array(arrayBuffer))
+
+    const result = await extractText(pdf)
+    const textParts: string[] = [`# Документ: ${file.name}`]
+
+    result.text.forEach((pageText, pageIndex) => {
+      const cleanPageText = normalizeExtractedText(pageText)
+
+      if (!cleanPageText) {
+        return
+      }
+
+      textParts.push(`# Страница ${pageIndex + 1}`, cleanPageText)
+    })
+
+    return createTextFile(
+      file,
+      textParts.join('\n\n'),
+      'В PDF не найден текст. Возможно, это сканированный документ — для него требуется OCR'
+    )
+  } catch (error) {
+    if (error instanceof AppApiError) {
+      throw error
+    }
+
+    throw new AppApiError(
+      400,
+      'Не удалось прочитать PDF. Проверьте, что файл не повреждён и не защищён паролем'
+    )
+  } finally {
+    if (pdf) {
+      await pdf.destroy().catch(() => undefined)
+    }
+  }
+}
+
+async function convertDocxToTextFile(file: File) {
+  try {
+    const arrayBuffer = await file.arrayBuffer()
+    const buffer = Buffer.from(arrayBuffer)
+
+    const result = await mammoth.extractRawText({
+      buffer
+    })
+
+    const warnings = result.messages
+      .filter(message => message.type === 'warning')
+      .map(message => message.message)
+      .filter(Boolean)
+
+    const textParts = [`# Документ: ${file.name}`, result.value]
+
+    if (warnings.length > 0) {
+      console.warn('DOCX IMPORT WARNINGS:', {
+        fileName: file.name,
+        warnings
+      })
+    }
+
+    return createTextFile(
+      file,
+      textParts.join('\n\n'),
+      'DOCX файл пустой или не содержит доступного текста'
+    )
+  } catch (error) {
+    if (error instanceof AppApiError) {
+      throw error
+    }
+
+    throw new AppApiError(
+      400,
+      'Не удалось прочитать DOCX. Проверьте, что файл не повреждён и имеет формат .docx'
+    )
+  }
+}
+
+async function convertSupportedFileToTextFile(file: File) {
+  if (isSpreadsheetFile(file)) {
+    return convertSpreadsheetToTextFile(file)
   }
 
-  const originalExtension = getFileExtension(file.name)
-  const textFileName = file.name.replace(
-    new RegExp(`${originalExtension.replace('.', '\\.')}$`, 'i'),
-    '.txt'
-  )
+  if (isPdfFile(file)) {
+    return convertPdfToTextFile(file)
+  }
 
-  return new File([text], textFileName, {
-    type: 'text/plain'
-  })
+  if (isDocxFile(file)) {
+    return convertDocxToTextFile(file)
+  }
+
+  return file
 }
 
 function serializeSource(
@@ -168,9 +340,7 @@ export async function POST(request: Request) {
       throw new AppApiError(400, 'Файл не передан')
     }
 
-    const fileForImport = isSpreadsheetFile(file)
-      ? await convertSpreadsheetToTextFile(file)
-      : file
+    const fileForImport = await convertSupportedFileToTextFile(file)
 
     const result = await importKnowledgeFile({
       actorId: currentUser.id,
