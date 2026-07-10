@@ -125,8 +125,24 @@ type EmbeddingProgress = {
   currentBatch: number
 }
 
-const TEXT_ACCEPT =
-  '.txt,.jsonl,.xlsx,.xls,.csv,text/plain,application/json,application/jsonl,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv'
+const TEXT_ACCEPT = [
+  '.txt',
+  '.jsonl',
+  '.xlsx',
+  '.xls',
+  '.csv',
+  '.pdf',
+  '.docx',
+  'text/plain',
+  'application/json',
+  'application/jsonl',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-excel',
+  'text/csv',
+  'application/csv',
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+].join(',')
 
 const AUDIO_ACCEPT =
   '.mp3,.wav,.m4a,.ogg,.aac,.flac,.webm,.mp4,audio/*,video/mp4'
@@ -139,6 +155,18 @@ const TEXT_EXTENSIONS = new Set([
   '.csv',
   '.pdf',
   '.docx'
+])
+
+const TEXT_MIME_TYPES = new Set([
+  'text/plain',
+  'application/json',
+  'application/jsonl',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-excel',
+  'text/csv',
+  'application/csv',
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 ])
 const AUDIO_EXTENSIONS = new Set([
   '.mp3',
@@ -188,9 +216,11 @@ function isAllowedFile(file: File, sourceKind: UploadSourceKind) {
     return AUDIO_EXTENSIONS.has(extension)
   }
 
-  if (file.type === 'text/plain') return true
-  if (file.type === 'application/json') return true
-  if (file.type === 'application/jsonl') return true
+  const normalizedMimeType = file.type.toLowerCase()
+
+  if (TEXT_MIME_TYPES.has(normalizedMimeType)) {
+    return true
+  }
 
   return TEXT_EXTENSIONS.has(extension)
 }
@@ -378,7 +408,7 @@ function getSourceKindLabel(sourceKind: UploadSourceKind) {
     return 'Аудиофайлы'
   }
 
-  return 'Текстовые файлы'
+  return 'Документы и текстовые файлы'
 }
 
 function getFileInputAccept(sourceKind: UploadSourceKind) {
@@ -394,7 +424,7 @@ function getFileInputHint(sourceKind: UploadSourceKind) {
     return 'Можно выбрать сразу много MP3, WAV, M4A, OGG, AAC, FLAC, WEBM или MP4. Файлы будут загружаться на сервер, сервер расшифрует аудио в текст и добавит результат в базу знаний.'
   }
 
-  return 'Можно выбрать сразу много TXT, PDF, DOCX, JSONL, XLSX, XLS или CSV файлов. Excel-таблицы будут превращены в текст и импортированы в базу знаний.'
+  return 'Можно выбрать сразу много TXT, JSONL, XLSX, XLS, CSV, PDF или DOCX файлов. Таблицы, PDF и Word-документы будут преобразованы в текст и импортированы в базу знаний. Для сканированных PDF без текстового слоя потребуется OCR.'
 }
 
 function getImportButtonLabel(
@@ -598,7 +628,7 @@ export function KnowledgePageClient() {
   const acceptedExtensionsLabel = useMemo(() => {
     return sourceKind === 'audio'
       ? 'MP3, WAV, M4A, OGG, AAC, FLAC, WEBM, MP4'
-      : 'TXT, JSONL, PDF, DOCX'
+      : 'TXT, JSONL, XLSX, XLS, CSV, PDF, DOCX'
   }, [sourceKind])
 
   function handleSourceKindChange(value: string | null) {
@@ -876,7 +906,9 @@ export function KnowledgePageClient() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="text">Текстовые файлы</SelectItem>
+                  <SelectItem value="text">
+                    Документы и текстовые файлы
+                  </SelectItem>
                   <SelectItem value="audio">Аудиофайлы</SelectItem>
                 </SelectContent>
               </Select>
@@ -935,7 +967,20 @@ export function KnowledgePageClient() {
                 использовать эти данные как память через поиск по базе знаний.
               </p>
             </div>
-          ) : null}
+          ) : (
+            <div className="rounded-lg border bg-muted/40 p-4">
+              <p className="text-sm font-medium">
+                Как будут обработаны документы
+              </p>
+              <p className="mt-1 text-sm text-muted-foreground">
+                TXT и JSONL будут импортированы напрямую. Excel и CSV будут
+                преобразованы в структурированный текст. Из PDF и DOCX backend
+                извлечёт текст, после чего разобьёт его на chunks и подготовит
+                для embeddings. Сканированные PDF без текстового слоя требуют
+                отдельного OCR.
+              </p>
+            </div>
+          )}
 
           <div className="space-y-2">
             <Label>Файлы</Label>
