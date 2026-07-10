@@ -3,6 +3,7 @@
 import {
   CheckCircle2,
   Copy,
+  Database,
   Download,
   FileArchive,
   FileAudio2,
@@ -21,8 +22,30 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue
+} from '@/components/ui/select'
 
 type FileStatus = 'queued' | 'processing' | 'success' | 'error'
+
+type KnowledgeImportStatus = 'idle' | 'uploading' | 'success' | 'error'
+
+type KnowledgeImportStats = {
+  conversationsCount: number
+  messagesCount: number
+  chunksCount: number
+}
+
+type KnowledgeImportResponse = {
+  source: {
+    id: string
+  }
+  stats: KnowledgeImportStats
+}
 
 type TranscribeItem = {
   id: string
@@ -33,6 +56,11 @@ type TranscribeItem = {
   error?: string
   requestId?: string | null
   taskId?: string | null
+  knowledgeStatus: KnowledgeImportStatus
+  knowledgeProgress: number
+  knowledgeError?: string
+  knowledgeStats?: KnowledgeImportStats
+  knowledgeSourceId?: string
 }
 
 type SavedSettings = {
@@ -45,6 +73,8 @@ type SavedSettings = {
   speakerCount: string
   speaker0Role: string
   speaker1Role: string
+  knowledgeTitlePrefix: string
+  knowledgeChannel: string
 }
 
 type TranscribeResponse = {
@@ -93,7 +123,9 @@ const DEFAULT_SETTINGS: SavedSettings = {
   diarizationEnabled: false,
   speakerCount: '2',
   speaker0Role: 'Менеджер',
-  speaker1Role: 'Клиент'
+  speaker1Role: 'Клиент',
+  knowledgeTitlePrefix: 'Расшифровка звонка',
+  knowledgeChannel: 'PHONE'
 }
 
 const AUDIO_ACCEPT =
@@ -195,6 +227,21 @@ function getStatusVariant(status: FileStatus) {
   return 'secondary'
 }
 
+function getKnowledgeStatusLabel(status: KnowledgeImportStatus) {
+  if (status === 'idle') return 'Ожидает отправки'
+  if (status === 'uploading') return 'Отправляется'
+  if (status === 'success') return 'Добавлен в базу'
+
+  return 'Ошибка импорта'
+}
+
+function getKnowledgeStatusVariant(status: KnowledgeImportStatus) {
+  if (status === 'success') return 'default'
+  if (status === 'error') return 'destructive'
+
+  return 'secondary'
+}
+
 function sanitizeFileName(fileName: string) {
   const cleanName = fileName
     .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_')
@@ -240,6 +287,17 @@ function createUniqueTxtFileName(
 
 function createTxtContent(item: TranscribeItem) {
   return item.text.trim()
+}
+
+function createKnowledgeTitle(fileName: string, titlePrefix: string) {
+  const txtFileName = createBaseTxtFileName(fileName)
+  const cleanPrefix = titlePrefix.trim()
+
+  if (!cleanPrefix) {
+    return txtFileName
+  }
+
+  return `${cleanPrefix}: ${txtFileName}`
 }
 
 function getDownloadFileName(response: Response, fallbackFileName: string) {
@@ -391,6 +449,116 @@ async function transcribeFileWithRetry(params: {
   throw lastError || new Error('Не удалось распознать аудио')
 }
 
+async function importTranscriptToKnowledge(params: {
+  originalFile: File
+  text: string
+  settings: SavedSettings
+  onProgress?: (progress: number) => void
+}) {
+  return new Promise<KnowledgeImportResponse>((resolve, reject) => {
+    const txtFileName = createBaseTxtFileName(params.originalFile.name)
+    const txtFile = new File([params.text.trim()], txtFileName, {
+      type: 'text/plain;charset=utf-8',
+      lastModified: Date.now()
+    })
+    const formData = new FormData()
+    const xhr = new XMLHttpRequest()
+
+    formData.append('file', txtFile)
+    formData.append(
+      'title',
+      createKnowledgeTitle(
+        params.originalFile.name,
+        params.settings.knowledgeTitlePrefix
+      )
+    )
+    formData.append('channel', params.settings.knowledgeChannel)
+    formData.append('sourceKind', 'text')
+
+    xhr.open('POST', '/api/admin-api/knowledge/import')
+
+    xhr.upload.onprogress = event => {
+      if (!event.lengthComputable) return
+
+      const progress = Math.round((event.loaded / event.total) * 100)
+
+      params.onProgress?.(Math.min(progress, 95))
+    }
+
+    xhr.onload = () => {
+      let json: unknown = null
+
+      try {
+        json = JSON.parse(xhr.responseText)
+      } catch {
+        json = null
+      }
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        params.onProgress?.(100)
+        resolve(json as KnowledgeImportResponse)
+        return
+      }
+
+      const message =
+        json &&
+        typeof json === 'object' &&
+        'error' in json &&
+        typeof json.error === 'string'
+          ? json.error
+          : xhr.responseText || 'Не удалось импортировать TXT в базу знаний'
+
+      reject(new Error(message))
+    }
+
+    xhr.onerror = () => {
+      reject(new Error('Ошибка сети при импорте TXT в базу знаний'))
+    }
+
+    xhr.onabort = () => {
+      reject(new Error('Импорт TXT в базу знаний был отменён'))
+    }
+
+    xhr.send(formData)
+  })
+}
+
+async function runWithConcurrency<T, R>(params: {
+  items: T[]
+  concurrency: number
+  worker: (item: T, index: number) => Promise<R>
+}) {
+  const results = new Array<R>(params.items.length)
+  let nextIndex = 0
+
+  async function runWorker() {
+    while (true) {
+      const index = nextIndex
+      nextIndex += 1
+
+      if (index >= params.items.length) {
+        return
+      }
+
+      results[index] = await params.worker(params.items[index], index)
+    }
+  }
+
+  const workers = Array.from(
+    {
+      length: Math.min(
+        Math.max(1, params.concurrency),
+        Math.max(1, params.items.length)
+      )
+    },
+    () => runWorker()
+  )
+
+  await Promise.all(workers)
+
+  return results
+}
+
 async function transcribeFile(params: { file: File; settings: SavedSettings }) {
   const formData = new FormData()
 
@@ -438,6 +606,7 @@ export function AudioTranscriberPageClient() {
   const [isProcessing, setIsProcessing] = useState(false)
   const [isZipCreating, setIsZipCreating] = useState(false)
   const [isFolderSaving, setIsFolderSaving] = useState(false)
+  const [isKnowledgeImporting, setIsKnowledgeImporting] = useState(false)
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -453,6 +622,21 @@ export function AudioTranscriberPageClient() {
   const errorCount = items.filter(item => item.status === 'error').length
   const processingCount = items.filter(
     item => item.status === 'processing'
+  ).length
+  const knowledgeSuccessCount = items.filter(
+    item => item.knowledgeStatus === 'success'
+  ).length
+  const knowledgeErrorCount = items.filter(
+    item => item.knowledgeStatus === 'error'
+  ).length
+  const knowledgeUploadingCount = items.filter(
+    item => item.knowledgeStatus === 'uploading'
+  ).length
+  const knowledgePendingCount = items.filter(
+    item =>
+      item.status === 'success' &&
+      item.text.trim() &&
+      item.knowledgeStatus !== 'success'
   ).length
 
   function updateSetting<K extends keyof SavedSettings>(
@@ -483,7 +667,8 @@ export function AudioTranscriberPageClient() {
     saveSettingsToStorage(settings)
 
     toast.success('Настройки сохранены', {
-      description: 'QWEN_API_KEY и параметры Fun-ASR сохранены в браузере'
+      description:
+        'Параметры Fun-ASR и отправки в базу знаний сохранены в браузере'
     })
   }
 
@@ -509,7 +694,9 @@ export function AudioTranscriberPageClient() {
       file,
       status: 'queued',
       progress: 0,
-      text: ''
+      text: '',
+      knowledgeStatus: 'idle',
+      knowledgeProgress: 0
     }))
 
     setItems(nextItems)
@@ -529,13 +716,148 @@ export function AudioTranscriberPageClient() {
   }
 
   function handleClearFiles() {
-    if (isProcessing || isZipCreating || isFolderSaving) return
+    if (isProcessing || isZipCreating || isFolderSaving || isKnowledgeImporting)
+      return
 
     setItems([])
 
     if (fileInputRef.current) {
       fileInputRef.current.value = ''
     }
+  }
+
+  async function sendTranscriptToKnowledge(params: {
+    itemId: string
+    file: File
+    text: string
+  }) {
+    updateItem(params.itemId, current => ({
+      ...current,
+      knowledgeStatus: 'uploading',
+      knowledgeProgress: 0,
+      knowledgeError: undefined,
+      knowledgeStats: undefined
+    }))
+
+    try {
+      const data = await importTranscriptToKnowledge({
+        originalFile: params.file,
+        text: params.text,
+        settings,
+        onProgress: progress => {
+          updateItem(params.itemId, current => ({
+            ...current,
+            knowledgeProgress: progress
+          }))
+        }
+      })
+
+      updateItem(params.itemId, current => ({
+        ...current,
+        knowledgeStatus: 'success',
+        knowledgeProgress: 100,
+        knowledgeError: undefined,
+        knowledgeStats: data.stats,
+        knowledgeSourceId: data.source?.id
+      }))
+
+      return {
+        status: 'success' as const,
+        data
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Не удалось импортировать TXT в базу знаний'
+
+      updateItem(params.itemId, current => ({
+        ...current,
+        knowledgeStatus: 'error',
+        knowledgeProgress: 0,
+        knowledgeError: message
+      }))
+
+      return {
+        status: 'error' as const,
+        error: message
+      }
+    }
+  }
+
+  async function handleImportItemToKnowledge(item: TranscribeItem) {
+    const text = createTxtContent(item)
+
+    if (!text) {
+      toast.error('Нет готового текста для импорта')
+      return
+    }
+
+    setIsKnowledgeImporting(true)
+
+    const result = await sendTranscriptToKnowledge({
+      itemId: item.id,
+      file: item.file,
+      text
+    })
+
+    setIsKnowledgeImporting(false)
+
+    if (result.status === 'success') {
+      toast.success('TXT добавлен в базу знаний', {
+        description: createBaseTxtFileName(item.file.name)
+      })
+      return
+    }
+
+    toast.error('Не удалось добавить TXT в базу знаний', {
+      description: result.error
+    })
+  }
+
+  async function handleImportAllReadyToKnowledge() {
+    const readyItems = items.filter(
+      item =>
+        item.status === 'success' &&
+        item.text.trim() &&
+        item.knowledgeStatus !== 'success'
+    )
+
+    if (readyItems.length === 0) {
+      toast.success('Все готовые TXT уже добавлены в базу знаний')
+      return
+    }
+
+    setIsKnowledgeImporting(true)
+
+    const results = await runWithConcurrency({
+      items: readyItems,
+      concurrency: 4,
+      worker: item =>
+        sendTranscriptToKnowledge({
+          itemId: item.id,
+          file: item.file,
+          text: createTxtContent(item)
+        })
+    })
+
+    setIsKnowledgeImporting(false)
+
+    const imported = results.filter(
+      result => result.status === 'success'
+    ).length
+    const failed = results.length - imported
+
+    if (imported > 0 && failed === 0) {
+      toast.success('Все TXT добавлены в базу знаний', {
+        description: `Импортировано файлов: ${imported}`
+      })
+      return
+    }
+
+    toast.error('Импорт в базу знаний завершён с ошибками', {
+      description: `Успешно: ${imported}, ошибок: ${failed}`
+    })
   }
 
   async function handleCopyText(text: string) {
@@ -706,15 +1028,24 @@ export function AudioTranscriberPageClient() {
         status: 'queued',
         progress: 0,
         error: undefined,
-        text: ''
+        text: '',
+        knowledgeStatus: 'idle',
+        knowledgeProgress: 0,
+        knowledgeError: undefined,
+        knowledgeStats: undefined,
+        knowledgeSourceId: undefined
       }))
     }
 
     const results: Array<{
       status: 'success' | 'error'
       item: TranscribeItem
+      text?: string
       error?: string
     }> = []
+
+    let knowledgeImportedCount = 0
+    let knowledgeFailedCount = 0
 
     const batches = chunkArray(itemsToProcess, TRANSCRIBE_BATCH_SIZE)
 
@@ -757,11 +1088,17 @@ export function AudioTranscriberPageClient() {
               }
             })
 
+            const transcriptText = result.text?.trim()
+
+            if (!transcriptText) {
+              throw new Error('Сервис распознавания вернул пустой текст')
+            }
+
             updateItem(item.id, current => ({
               ...current,
               status: 'success',
               progress: 100,
-              text: result.text,
+              text: transcriptText,
               error: undefined,
               requestId: result.requestId,
               taskId: result.taskId ?? null
@@ -769,7 +1106,8 @@ export function AudioTranscriberPageClient() {
 
             return {
               status: 'success' as const,
-              item
+              item,
+              text: transcriptText
             }
           } catch (error) {
             const message =
@@ -795,6 +1133,39 @@ export function AudioTranscriberPageClient() {
 
       results.push(...batchResults)
 
+      const readyForKnowledge = batchResults.flatMap(result => {
+        if (result.status !== 'success' || !result.text?.trim()) {
+          return []
+        }
+
+        return [
+          {
+            item: result.item,
+            text: result.text
+          }
+        ]
+      })
+
+      if (readyForKnowledge.length > 0) {
+        const knowledgeResults = await runWithConcurrency({
+          items: readyForKnowledge,
+          concurrency: 4,
+          worker: result =>
+            sendTranscriptToKnowledge({
+              itemId: result.item.id,
+              file: result.item.file,
+              text: result.text
+            })
+        })
+
+        knowledgeImportedCount += knowledgeResults.filter(
+          result => result.status === 'success'
+        ).length
+        knowledgeFailedCount += knowledgeResults.filter(
+          result => result.status === 'error'
+        ).length
+      }
+
       const hasNextBatch = batchIndex < batches.length - 1
 
       if (hasNextBatch) {
@@ -811,15 +1182,15 @@ export function AudioTranscriberPageClient() {
     const done = results.filter(result => result.status === 'success').length
     const failed = results.filter(result => result.status === 'error').length
 
-    if (done > 0 && failed === 0) {
-      toast.success('Все аудио обработаны', {
-        description: `Готово TXT: ${done}`
+    if (done > 0 && failed === 0 && knowledgeFailedCount === 0) {
+      toast.success('Все аудио обработаны и добавлены в базу знаний', {
+        description: `Готово TXT: ${done}, импортировано: ${knowledgeImportedCount}`
       })
     }
 
-    if (failed > 0) {
+    if (failed > 0 || knowledgeFailedCount > 0) {
       toast.error('Обработка завершена с ошибками', {
-        description: `Готово: ${done}, ошибок: ${failed}`
+        description: `TXT готово: ${done}, ошибок распознавания: ${failed}, импортировано: ${knowledgeImportedCount}, ошибок импорта: ${knowledgeFailedCount}`
       })
     }
   }
@@ -831,8 +1202,8 @@ export function AudioTranscriberPageClient() {
           Конвертер аудио в TXT
         </h1>
         <p className="text-muted-foreground">
-          Массовая расшифровка аудиофайлов через Fun-ASR. Каждый аудиофайл
-          превращается в отдельный TXT.
+          Массовая расшифровка аудиофайлов через Fun-ASR. Каждый готовый TXT
+          автоматически отправляется в базу знаний backend.
         </p>
       </div>
 
@@ -965,11 +1336,62 @@ export function AudioTranscriberPageClient() {
             </div>
           </div>
 
+          <div className="rounded-lg border bg-muted/40 p-4">
+            <div className="flex items-center gap-2">
+              <Database className="h-5 w-5" />
+              <p className="text-sm font-medium">
+                Автоматическая отправка в базу знаний
+              </p>
+            </div>
+
+            <p className="mt-2 text-xs text-muted-foreground">
+              После распознавания текст создаётся как отдельный TXT и
+              автоматически отправляется в /api/admin-api/knowledge/import.
+            </p>
+
+            <div className="mt-4 grid gap-4 md:grid-cols-[1fr_220px]">
+              <div className="space-y-2">
+                <Label>Префикс названия источника</Label>
+                <Input
+                  value={settings.knowledgeTitlePrefix}
+                  onChange={event =>
+                    updateSetting('knowledgeTitlePrefix', event.target.value)
+                  }
+                  placeholder="Расшифровка звонка"
+                  disabled={isProcessing || isKnowledgeImporting}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label>Канал</Label>
+                <Select
+                  value={settings.knowledgeChannel}
+                  onValueChange={value =>
+                    updateSetting('knowledgeChannel', value ?? 'PHONE')
+                  }
+                  disabled={isProcessing || isKnowledgeImporting}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="PHONE">PHONE</SelectItem>
+                    <SelectItem value="CHAT">CHAT</SelectItem>
+                    <SelectItem value="WHATSAPP">WHATSAPP</SelectItem>
+                    <SelectItem value="TELEGRAM">TELEGRAM</SelectItem>
+                    <SelectItem value="EMAIL">EMAIL</SelectItem>
+                    <SelectItem value="OTHER">OTHER</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          </div>
+
           <Button
             type="button"
             variant="outline"
             onClick={handleSaveSettings}
-            disabled={isProcessing}
+            disabled={isProcessing || isKnowledgeImporting}
           >
             <Save className="mr-2 h-4 w-4" />
             Сохранить настройки
@@ -994,14 +1416,16 @@ export function AudioTranscriberPageClient() {
               multiple
               accept={AUDIO_ACCEPT}
               onChange={handleFilesChange}
-              disabled={isProcessing}
+              disabled={isProcessing || isKnowledgeImporting}
             />
           </div>
 
           <div className="flex flex-wrap gap-2">
             <Button
               onClick={handleStart}
-              disabled={isProcessing || items.length === 0}
+              disabled={
+                isProcessing || isKnowledgeImporting || items.length === 0
+              }
             >
               {isProcessing ? (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -1016,15 +1440,44 @@ export function AudioTranscriberPageClient() {
             <Button
               variant="outline"
               onClick={handleClearFiles}
-              disabled={isProcessing || isZipCreating || isFolderSaving}
+              disabled={
+                isProcessing ||
+                isZipCreating ||
+                isFolderSaving ||
+                isKnowledgeImporting
+              }
             >
               Очистить список
             </Button>
 
             <Button
               variant="outline"
+              onClick={handleImportAllReadyToKnowledge}
+              disabled={
+                knowledgePendingCount === 0 ||
+                isProcessing ||
+                isKnowledgeImporting
+              }
+            >
+              {isKnowledgeImporting ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Database className="mr-2 h-4 w-4" />
+              )}
+              {isKnowledgeImporting
+                ? 'Отправляю TXT...'
+                : `Отправить TXT в базу знаний: ${knowledgePendingCount}`}
+            </Button>
+
+            <Button
+              variant="outline"
               onClick={handleDownloadZip}
-              disabled={successCount === 0 || isZipCreating || isFolderSaving}
+              disabled={
+                successCount === 0 ||
+                isZipCreating ||
+                isFolderSaving ||
+                isKnowledgeImporting
+              }
             >
               {isZipCreating ? (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -1037,7 +1490,12 @@ export function AudioTranscriberPageClient() {
             <Button
               variant="outline"
               onClick={handleSaveAllToFolder}
-              disabled={successCount === 0 || isZipCreating || isFolderSaving}
+              disabled={
+                successCount === 0 ||
+                isZipCreating ||
+                isFolderSaving ||
+                isKnowledgeImporting
+              }
             >
               {isFolderSaving ? (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -1053,8 +1511,12 @@ export function AudioTranscriberPageClient() {
               <div className="mb-4">
                 <p className="text-sm font-medium">Файлов: {items.length}</p>
                 <p className="text-xs text-muted-foreground">
-                  Готово: {successCount}, ошибок: {errorCount}, в обработке:{' '}
-                  {processingCount}
+                  Готово TXT: {successCount}, ошибок распознавания: {errorCount}
+                  , в обработке: {processingCount}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  В базе знаний: {knowledgeSuccessCount}, ошибок импорта:{' '}
+                  {knowledgeErrorCount}, отправляется: {knowledgeUploadingCount}
                 </p>
               </div>
 
@@ -1106,6 +1568,59 @@ export function AudioTranscriberPageClient() {
                     ) : null}
 
                     {item.text ? (
+                      <div className="mt-3 rounded-md border bg-muted/30 p-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center gap-2">
+                            <Database className="h-4 w-4" />
+                            <span className="text-sm font-medium">
+                              База знаний
+                            </span>
+                          </div>
+
+                          <Badge
+                            variant={getKnowledgeStatusVariant(
+                              item.knowledgeStatus
+                            )}
+                          >
+                            {getKnowledgeStatusLabel(item.knowledgeStatus)}
+                          </Badge>
+                        </div>
+
+                        {item.knowledgeStatus === 'uploading' ? (
+                          <>
+                            <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted">
+                              <div
+                                className="h-full bg-primary transition-all"
+                                style={{
+                                  width: `${item.knowledgeProgress}%`
+                                }}
+                              />
+                            </div>
+                            <p className="mt-1 text-xs text-muted-foreground">
+                              {item.knowledgeProgress < 95
+                                ? `Отправка TXT: ${item.knowledgeProgress}%`
+                                : 'TXT загружен, backend импортирует разговор и создаёт chunks...'}
+                            </p>
+                          </>
+                        ) : null}
+
+                        {item.knowledgeStats ? (
+                          <p className="mt-2 text-xs text-muted-foreground">
+                            Разговоров: {item.knowledgeStats.conversationsCount}
+                            , сообщений: {item.knowledgeStats.messagesCount},
+                            chunks: {item.knowledgeStats.chunksCount}
+                          </p>
+                        ) : null}
+
+                        {item.knowledgeError ? (
+                          <p className="mt-2 text-xs text-destructive">
+                            {item.knowledgeError}
+                          </p>
+                        ) : null}
+                      </div>
+                    ) : null}
+
+                    {item.text ? (
                       <div className="mt-4 space-y-3">
                         <div className="flex flex-wrap gap-2">
                           <Button
@@ -1125,6 +1640,28 @@ export function AudioTranscriberPageClient() {
                             <Download className="mr-2 h-4 w-4" />
                             Скачать TXT
                           </Button>
+
+                          {item.knowledgeStatus !== 'success' ? (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => handleImportItemToKnowledge(item)}
+                              disabled={
+                                isProcessing ||
+                                isKnowledgeImporting ||
+                                item.knowledgeStatus === 'uploading'
+                              }
+                            >
+                              {item.knowledgeStatus === 'uploading' ? (
+                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                              ) : (
+                                <Database className="mr-2 h-4 w-4" />
+                              )}
+                              {item.knowledgeStatus === 'error'
+                                ? 'Повторить импорт'
+                                : 'Отправить в базу знаний'}
+                            </Button>
+                          ) : null}
                         </div>
 
                         <textarea
