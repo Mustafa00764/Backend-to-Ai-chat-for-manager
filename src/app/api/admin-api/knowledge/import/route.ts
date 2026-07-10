@@ -7,7 +7,7 @@ import { importKnowledgeFile } from '@/server/knowledge/knowledge-import-service
 
 export const runtime = 'nodejs'
 
-const SPREADSHEET_EXTENSIONS = new Set(['.xlsx', '.xls', '.csv'])
+const SPREADSHEET_EXTENSIONS = new Set(['.xlsx', '.xls', '.csv', '.pdf', '.docx'])
 
 const SPREADSHEET_MIME_TYPES = new Set([
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
